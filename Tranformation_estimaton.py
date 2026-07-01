@@ -99,7 +99,7 @@ class Estimator():
             distance = torch.norm(warped_src_keypts[:, :, None, :] - tgt_points[:, None, :, :], dim=-1)
             min_distance, min_idx = torch.min(distance.squeeze(0), dim=1)
             min_distance_mask = min_distance < inlier_threshold
-            row_indices = torch.arange(0, min_idx.shape[0])[min_distance_mask].cuda()
+            row_indices = torch.arange(0, min_idx.shape[0], device=min_idx.device)[min_distance_mask]
             min_idx_select = min_idx[min_distance_mask]
             col_indices = min_idx_select
             inlier_num = min_idx_select.shape[0]

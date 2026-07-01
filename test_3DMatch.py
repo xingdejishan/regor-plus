@@ -49,7 +49,7 @@ def read_trajectory_info(filename, dim=6):
             [np.fromstring(item, sep='\t').reshape(1, -1) for item in contents[i * 7 + 1:i * 7 + 7]], axis=0)
         info_list.append(info_matrix)
 
-    cov_matrix = np.asarray(info_list, dtype=np.float).reshape(-1, dim, dim)
+    cov_matrix = np.asarray(info_list, dtype=float).reshape(-1, dim, dim)
 
     return n_frame, cov_matrix
 
@@ -236,7 +236,8 @@ def eval_3DMatch(config, use_icp):
         estimator = Estimator()
         trans_evaluator = TransformationLoss(re_thre=config.re_thre, te_thre=config.te_thre)
         cls_evaluator = ClassificationLoss(inlier_threshold=config.inlier_threshold)
-        _, gt_traj_cov = read_trajectory_info(os.path.join(f"/home/zhaoguiyu/code/OverlapPredator-main/configs/benchmarks/{config.dataset}/{scene}", "gt.info"))
+        gt_info_path = os.path.join("benchmarks", config.dataset, scene, "gt.info")
+        _, gt_traj_cov = read_trajectory_info(gt_info_path)
 
 
         scene_stats = eval_3DMatch_scene(loader, matcher, regenerator, estimator, trans_evaluator, cls_evaluator, scene, scene_ind, config, use_icp, gt_traj_cov)

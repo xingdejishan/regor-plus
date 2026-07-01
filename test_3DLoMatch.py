@@ -194,7 +194,7 @@ def eval_3DLoMatch(config):
     )
 
     regenerator = Regenerator()
-    estimator = Estimator()
+    estimator = Estimator(num_node=config.num_node)
     trans_evaluator = TransformationLoss(re_thre=config.re_thre, te_thre=config.te_thre)
     cls_evaluator = ClassificationLoss(inlier_threshold=config.inlier_threshold)
 
