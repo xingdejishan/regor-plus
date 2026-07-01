@@ -147,6 +147,8 @@ class ThreeDLoMatchLoader(data.Dataset):
             src_features = torch.from_numpy(src_features.astype(np.float32)).cuda()
             tgt_features = torch.from_numpy(tgt_features.astype(np.float32)).cuda()
             gt_trans = torch.from_numpy(gt_trans.astype(np.float32)).cuda()
+            src_overlap = torch.ones(src_keypts.shape[0], dtype=torch.float32, device=src_keypts.device)
+            tgt_overlap = torch.ones(tgt_keypts.shape[0], dtype=torch.float32, device=tgt_keypts.device)
 
         elif self.descriptor == 'fpfh':
             src_data = np.load(f"{self.root}/fragments/{scene}/cloud_bin_{src_id}_fpfh.npz")
@@ -163,6 +165,8 @@ class ThreeDLoMatchLoader(data.Dataset):
             src_features = torch.from_numpy(src_features.astype(np.float32)).cuda()
             tgt_features = torch.from_numpy(tgt_features.astype(np.float32)).cuda()
             gt_trans = torch.from_numpy(gt_trans.astype(np.float32)).cuda()
+            src_overlap = torch.ones(src_keypts.shape[0], dtype=torch.float32, device=src_keypts.device)
+            tgt_overlap = torch.ones(tgt_keypts.shape[0], dtype=torch.float32, device=tgt_keypts.device)
         elif self.descriptor == "predator":
             data_dict = torch.load(
                 f'{self.root}/{index}.pth')
@@ -172,30 +176,30 @@ class ThreeDLoMatchLoader(data.Dataset):
             src_features = data_dict['feats'][:len_src].cuda()
             tgt_features = data_dict['feats'][len_src:].cuda()
             saliency, overlap = data_dict['saliency'], data_dict['overlaps']
-            src_overlap, src_saliency = overlap[:len_src], saliency[:len_src]
-            tgt_overlap, tgt_saliency = overlap[len_src:], saliency[len_src:]
+            src_overlap, src_saliency = overlap[:len_src].cuda(), saliency[:len_src].cuda()
+            tgt_overlap, tgt_saliency = overlap[len_src:].cuda(), saliency[len_src:].cuda()
             src_scores = src_overlap * src_saliency
             tgt_scores = tgt_overlap * tgt_saliency
             if not isinstance(self.num_node,str):
                 if (src_keypts.size(0) > self.num_node):
                     idx = np.arange(src_keypts.size(0))
-                    probs = (src_scores / src_scores.sum()).numpy().flatten()
+                    probs = (src_scores / src_scores.sum()).cpu().numpy().flatten()
                     idx = np.random.choice(idx, size=self.num_node, replace=False, p=probs)
-                    src_keypts, src_features = src_keypts[idx], src_features[idx]
+                    src_keypts, src_features, src_overlap = src_keypts[idx], src_features[idx], src_overlap[idx]
                 if (tgt_keypts.size(0) > self.num_node):
                     idx = np.arange(tgt_keypts.size(0))
-                    probs = (tgt_scores / tgt_scores.sum()).numpy().flatten()
+                    probs = (tgt_scores / tgt_scores.sum()).cpu().numpy().flatten()
                     idx = np.random.choice(idx, size=self.num_node, replace=False, p=probs)
-                    tgt_keypts, tgt_features = tgt_keypts[idx], tgt_features[idx]
+                    tgt_keypts, tgt_features, tgt_overlap = tgt_keypts[idx], tgt_features[idx], tgt_overlap[idx]
             gt_trans = integrate_trans(data_dict['rot'], data_dict['trans']).cuda()
 
         if not isinstance(self.num_node, str):
             if src_keypts.size(0) > self.num_node:
                 idx = torch.randperm(src_keypts.size(0), device=src_keypts.device)[:self.num_node]
-                src_keypts, src_features = src_keypts[idx], src_features[idx]
+                src_keypts, src_features, src_overlap = src_keypts[idx], src_features[idx], src_overlap[idx]
             if tgt_keypts.size(0) > self.num_node:
                 idx = torch.randperm(tgt_keypts.size(0), device=tgt_keypts.device)[:self.num_node]
-                tgt_keypts, tgt_features = tgt_keypts[idx], tgt_features[idx]
+                tgt_keypts, tgt_features, tgt_overlap = tgt_keypts[idx], tgt_features[idx], tgt_overlap[idx]
 
         return (
             src_keypts[None],
@@ -205,6 +209,8 @@ class ThreeDLoMatchLoader(data.Dataset):
             gt_trans[None],
             src_keypts[None],
             tgt_keypts[None],
+            src_overlap[None],
+            tgt_overlap[None],
         )
 
 

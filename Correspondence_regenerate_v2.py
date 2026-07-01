@@ -23,6 +23,9 @@ class Regenerator():
                  max_points=8000,
                  k1=30,
                  k2=20,
+                 prior_lambda=0.1,
+                 eta_l=0.5,
+                 prior_eps=1e-4,
                  select_scene=None,
                  ):
         self.use_sampling = False
@@ -36,6 +39,9 @@ class Regenerator():
         self.nms_radius = nms_radius
         self.k1 = k1
         self.k2 = k2
+        self.prior_lambda = prior_lambda
+        self.eta_l = eta_l
+        self.prior_eps = prior_eps
         self.sampling_num = 0
         self.DEBUG = False
 
@@ -135,7 +141,7 @@ class Regenerator():
 
         return indices_total_src.unsqueeze(0), indices_total_tgt.unsqueeze(0)
 
-    def local_matching(self, src_key_corr, tgt_key_corr, src_corr_knn_idx, tgt_corr_knn_idx, src_point, tgt_point, src_feature, tgt_feature):
+    def local_matching(self, src_key_corr, tgt_key_corr, src_corr_knn_idx, tgt_corr_knn_idx, src_point, tgt_point, src_feature, tgt_feature, guide=None):
         # - src_key_corr: [bs, num_key_corr, 3]
         # - tgt_key_corr: [bs, num_key_corr, 3]
 
@@ -149,7 +155,15 @@ class Regenerator():
         ot_timer.tic()
 
         ''' GMM matching '''
-        match_mask = self.match_pair_GMM(src_feature_knn, tgt_feature_knn)
+        match_mask = self.match_pair_GMM(
+            src_feature_knn,
+            tgt_feature_knn,
+            src_point_knn,
+            tgt_point_knn,
+            src_corr_knn_idx[0],
+            tgt_corr_knn_idx[0],
+            guide=guide
+        )
         bs_idx, src_idx, tgt_idx = torch.where(match_mask)
         src_local_corr_idx = src_corr_knn_idx[:, bs_idx, src_idx]
         tgt_local_corr_idx = tgt_corr_knn_idx[:, bs_idx, tgt_idx]
@@ -161,8 +175,8 @@ class Regenerator():
         src_point_corr_mm = src_point.gather(dim=1, index=unique_selected_src_corr_idx[None, :, None].expand(-1, -1, 3)).view([1, -1, 3])
         tgt_point_corr_mm = tgt_point.gather(dim=1, index=unique_selected_tgt_corr_idx[None, :, None].expand(-1, -1, 3)).view([1, -1, 3])
 
-        correspondences = torch.zeros((num_seeds, num_knn*2, 2), dtype=torch.int64).cuda()
-        correspondences_true_mask = torch.zeros((num_seeds, num_knn*2), dtype=torch.bool).cuda()
+        correspondences = torch.zeros((num_seeds, num_knn*2, 2), dtype=torch.int64, device=src_point.device)
+        correspondences_true_mask = torch.zeros((num_seeds, num_knn*2), dtype=torch.bool, device=src_point.device)
         for i in range(num_seeds):
             src_idx, tgt_idx = torch.where(match_mask[i])
             num = src_idx.shape[0]
@@ -331,7 +345,7 @@ class Regenerator():
 
         return corr_idx[0]
 
-    def match_pair_GMM(self, src_features, tgt_features):
+    def match_pair_GMM(self, src_features, tgt_features, src_points=None, tgt_points=None, src_indices=None, tgt_indices=None, guide=None):
         """
         input:
             - src_key_corr: key points [bs,key_num,3]
@@ -347,24 +361,26 @@ class Regenerator():
 
         # match points in feature space with batch size. from src->tgt
         distance = torch.sqrt(2 - 2 * torch.matmul(src_features, tgt_features.transpose(1, 2)) + 1e-6)
+        if guide is not None:
+            distance = self.apply_guided_similarity(distance, src_points, tgt_points, src_indices, tgt_indices, guide)
         _, tgt_idx1 = torch.topk(distance, dim=2, largest=False, k=num_k)
-        src_idx1 = torch.arange(num_knn)[None, :, None].expand(num_seeds,-1, num_k).cuda()
-        bs_idx1 = torch.arange(num_seeds)[:, None, None].expand(-1, num_knn, num_k).cuda()
+        src_idx1 = torch.arange(num_knn, device=distance.device)[None, :, None].expand(num_seeds,-1, num_k)
+        bs_idx1 = torch.arange(num_seeds, device=distance.device)[:, None, None].expand(-1, num_knn, num_k)
 
-        mask_2_p2q = torch.zeros_like(distance, dtype=bool).cuda()
+        mask_2_p2q = torch.zeros_like(distance, dtype=bool, device=distance.device)
         mask_2_p2q[bs_idx1.reshape(-1), src_idx1.reshape(-1), tgt_idx1.reshape(-1)] = True
-        mask_1_p2q = torch.zeros_like(distance, dtype=bool).cuda()
+        mask_1_p2q = torch.zeros_like(distance, dtype=bool, device=distance.device)
         mask_1_p2q[bs_idx1[:, :, 0].reshape(-1), src_idx1[:, :, 0].reshape(-1), tgt_idx1[:, :, 0].reshape(-1)] = True
 
         # corr1 = torch.cat([src_idx1[:, :, None], tgt_idx1[:, :, None]], dim=-1)
         # match points in feature space with batch size. from tgt->src
         _, src_idx2 = torch.topk(distance, dim=1, largest=False, k=num_k)
-        tgt_idx2 = torch.arange(num_knn)[None, None, :].expand(num_seeds, num_k, -1).cuda()
-        bs_idx2 = torch.arange(num_seeds)[:, None, None].expand(-1, num_k, num_knn).cuda()
+        tgt_idx2 = torch.arange(num_knn, device=distance.device)[None, None, :].expand(num_seeds, num_k, -1)
+        bs_idx2 = torch.arange(num_seeds, device=distance.device)[:, None, None].expand(-1, num_k, num_knn)
 
-        mask_2_q2p = torch.zeros_like(distance, dtype=bool).cuda()
+        mask_2_q2p = torch.zeros_like(distance, dtype=bool, device=distance.device)
         mask_2_q2p[bs_idx2.reshape(-1), src_idx2.reshape(-1), tgt_idx2.reshape(-1)] = True
-        mask_1_q2p = torch.zeros_like(distance, dtype=bool).cuda()
+        mask_1_q2p = torch.zeros_like(distance, dtype=bool, device=distance.device)
         mask_1_q2p[bs_idx2[:, 0, :].reshape(-1), src_idx2[:, 0, :].reshape(-1), tgt_idx2[:, 0, :].reshape(-1)] = True
 
         # corr2 = torch.cat([src_idx2[:, :, None], tgt_idx2[:, :, None]], dim=-1)
@@ -374,6 +390,41 @@ class Regenerator():
         mutual_mask = mutual_mask_p2q | mutual_mask_q2p
 
         return mutual_mask
+
+    def apply_guided_similarity(self, distance, src_points, tgt_points, src_indices, tgt_indices, guide):
+        if src_points is None or tgt_points is None or src_indices is None or tgt_indices is None:
+            return distance
+
+        eps = guide.get('eps', self.prior_eps)
+        prior_lambda = guide.get('lambda', self.prior_lambda)
+        eta_l = guide.get('eta_l', self.eta_l)
+
+        src_prior = guide.get('source_prior')
+        src_under = guide.get('source_under_support')
+        tgt_under = guide.get('target_under_support')
+        c_ref = guide.get('c_ref')
+        r_src = guide.get('r_src')
+
+        if src_prior is None or src_under is None or tgt_under is None or c_ref is None or r_src is None:
+            return distance
+
+        src_prior_local = src_prior[src_indices].clamp(eps, 1.0)
+        src_under_local = src_under[src_indices].clamp(eps, 1.0)
+        tgt_under_local = tgt_under[tgt_indices].clamp(eps, 1.0)
+
+        lever_d = torch.norm(src_points - c_ref.view(1, 1, 3), dim=-1) / (r_src + eps)
+        lever = 1.0 + eta_l * lever_d.clamp(0.0, 1.0)
+        lever = torch.maximum(lever, torch.tensor(eps, device=distance.device, dtype=distance.dtype))
+
+        src_log_prior = (
+            torch.log(src_prior_local)
+            + torch.log(src_under_local)
+            + torch.log(lever)
+        )
+        tgt_log_prior = torch.log(tgt_under_local)
+        log_prior = src_log_prior[:, :, None] + tgt_log_prior[:, None, :]
+        adjusted = distance - prior_lambda * log_prior
+        return torch.nan_to_num(adjusted, nan=1e6, posinf=1e6, neginf=-1e6)
 
 
     def idx_selection(self, idx, points):
@@ -494,7 +545,7 @@ class Regenerator():
 
         return src_keypts_best_corr, tgt_keypts_best_corr
 
-    def regenerate(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, gt_trans, knn_num=100, sampling_num=100, knn_radius=0.8, use_sampling=False):
+    def regenerate(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, gt_trans, knn_num=100, sampling_num=100, knn_radius=0.8, use_sampling=False, guide=None):
         """
         Input:
             - src_key_corr: [bs, num_key_corr, 3]
@@ -525,7 +576,7 @@ class Regenerator():
         src_corr_knn_idx = self.knn_search(src_key_corr, src_point, self.knn_num)
         tgt_corr_knn_idx = self.knn_search(tgt_key_corr, tgt_point, self.knn_num)
 
-        src_corr, tgt_corr = self.local_matching(src_key_corr, tgt_key_corr, src_corr_knn_idx, tgt_corr_knn_idx, src_point, tgt_point, src_feature, tgt_feature)
+        src_corr, tgt_corr = self.local_matching(src_key_corr, tgt_key_corr, src_corr_knn_idx, tgt_corr_knn_idx, src_point, tgt_point, src_feature, tgt_feature, guide=guide)
 
         final_tran = rigid_transform_3d(src_corr, tgt_corr)
 
