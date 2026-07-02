@@ -423,7 +423,8 @@ class Regenerator():
         )
         tgt_log_prior = torch.log(tgt_under_local)
         log_prior = src_log_prior[:, :, None] + tgt_log_prior[:, None, :]
-        adjusted = distance - prior_lambda * log_prior
+        guided_score = -distance + prior_lambda * log_prior
+        adjusted = -guided_score
         return torch.nan_to_num(adjusted, nan=1e6, posinf=1e6, neginf=-1e6)
 
 

@@ -513,7 +513,6 @@ class Matcher_plus():
         # use the proposed SC2-PCR to estimate the rigid transformation
         #################################
         seedwise_trans, one_best_trans = self.SC2_PCR(src_keypts_corr, tgt_keypts_corr)
-        self.last_seedwise_trans = seedwise_trans.detach()
 
         select_trans = self.select_best_trans(seedwise_trans, src_keypts, relax_match_points,
                                               relax_distance, src_keypts_corr, tgt_keypts_corr)
