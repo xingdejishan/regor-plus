@@ -4,6 +4,7 @@ sys.path.append('.')
 import argparse
 import logging
 import os
+import copy
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -49,8 +50,12 @@ ACTIVE_REQUIRED_KEYS = (
     'use_rgbd_fsv',
     'use_overlap_proxy',
     'use_global_reset_fallback',
+    'use_mini_ransac_final',
+    'run_round2_ablation_suite',
     'round2_mode',
     'free_space_root',
+    'rgbd_root',
+    'overlap_pred_root',
     'active_round1_knn',
     'active_round1_sampling',
     'active_round2_knn',
@@ -74,6 +79,13 @@ ACTIVE_REQUIRED_KEYS = (
     'active_density_min',
     'active_balance_max',
     'active_robust_c',
+    'active_ransac_iters',
+    'active_max_rounds',
+    'active_fsv_voxel_size',
+    'active_fsv_depth_scale',
+    'active_fsv_trunc_margin',
+    'active_fsv_stride',
+    'active_fsv_max_frames',
     'active_round2_target_pool',
     'active_feature_chunk_size',
     'active_eps',
@@ -90,20 +102,22 @@ def validate_active_config(config):
     missing = [key for key in ACTIVE_REQUIRED_KEYS if not hasattr(config, key)]
     if missing:
         raise KeyError(f"Missing active REGOR-S2 config keys: {', '.join(missing)}")
-    if config.use_ctc:
-        raise NotImplementedError("use_ctc=True is not supported in REGOR-S2; CTC is intentionally removed.")
     if config.use_rgbd_fsv and config.use_fsv_proxy:
         raise ValueError("use_rgbd_fsv and use_fsv_proxy are mutually exclusive.")
     if not config.use_fsv_proxy and not config.use_rgbd_fsv:
         raise ValueError("Either use_fsv_proxy or use_rgbd_fsv must be enabled for diagnosis-guided early stop/reset.")
-    if config.use_rgbd_fsv and not config.free_space_root:
-        raise ValueError("use_rgbd_fsv=True requires free_space_root with precomputed target free-space volumes.")
+    if config.use_rgbd_fsv and not config.free_space_root and not config.rgbd_root:
+        raise ValueError("use_rgbd_fsv=True requires free_space_root or rgbd_root.")
     if config.round2_mode not in ROUND2_LABELS:
         raise ValueError("round2_mode must be one of: none, original, random_uniform, weakness_guided")
     if config.round2_mode == 'none' and config.use_round2:
         raise ValueError("round2_mode='none' requires use_round2=false.")
-    if config.descriptor != 'predator' and not config.use_overlap_proxy:
-        raise ValueError("Non-Predator descriptors require use_overlap_proxy=true or a real overlap prediction source.")
+    if config.use_round2 and config.active_max_rounds < 2:
+        raise ValueError("use_round2=True requires active_max_rounds >= 2.")
+    if config.descriptor != 'predator' and not config.use_overlap_proxy and not config.overlap_pred_root:
+        raise ValueError("Non-Predator descriptors require overlap_pred_root or explicit use_overlap_proxy=true.")
+    if config.active_max_rounds < 1:
+        raise ValueError("active_max_rounds must be >= 1.")
 
 
 def min_dist_to_points(query, reference, chunk_size=2048):
@@ -383,6 +397,34 @@ def sample_correspondences(src_corr, tgt_corr, sample_num):
     return src_corr[:, sel_ind, :], tgt_corr[:, sel_ind, :]
 
 
+def mini_ransac_transform(src, tgt, weights, threshold, ransac_iters):
+    valid = weights > 0
+    if valid.sum() < 3 or ransac_iters <= 0:
+        return rigid_transform_3d(src[None], tgt[None], weights=weights[None])
+    idx_pool = torch.nonzero(valid, as_tuple=False).flatten()
+    probs = weights[idx_pool].clamp_min(0)
+    probs = probs / probs.sum()
+    best_score = -1.0
+    best_trans = None
+    for _ in range(ransac_iters):
+        sample_pos = torch.multinomial(probs, 3, replacement=False if probs.shape[0] >= 3 else True)
+        sample_idx = idx_pool[sample_pos]
+        trans = rigid_transform_3d(src[sample_idx][None], tgt[sample_idx][None])
+        residual = torch.norm(transform_points(src, trans) - tgt, dim=1)
+        inlier = residual < threshold
+        score = float((weights * inlier.float()).sum().item())
+        if score > best_score:
+            best_score = score
+            best_trans = trans
+    if best_trans is None:
+        return rigid_transform_3d(src[None], tgt[None], weights=weights[None])
+    residual = torch.norm(transform_points(src, best_trans) - tgt, dim=1)
+    inlier = residual < threshold
+    if inlier.sum() < 3:
+        return best_trans
+    return rigid_transform_3d(src[inlier][None], tgt[inlier][None], weights=weights[inlier][None])
+
+
 def robust_weighted_estimate(src_corr, tgt_corr, initial_trans, config, match_weights=None):
     threshold = cfg_get(config, 'inlier_threshold', 0.1)
     voxel_size = active_param(config, 'active_final_voxel_size')
@@ -421,7 +463,10 @@ def robust_weighted_estimate(src_corr, tgt_corr, initial_trans, config, match_we
     if torch.sum(weights > 0) < 3:
         weights = torch.ones_like(weights)
 
-    pred_trans = rigid_transform_3d(src_corr, tgt_corr, weights=weights[None])
+    if active_param(config, 'use_mini_ransac_final'):
+        pred_trans = mini_ransac_transform(src, tgt, weights, threshold, active_param(config, 'active_ransac_iters'))
+    else:
+        pred_trans = rigid_transform_3d(src_corr, tgt_corr, weights=weights[None])
     final_residual = torch.norm(transform_points(src, pred_trans) - tgt, dim=1)
     pred_labels = final_residual[None] < threshold
     if pred_labels.sum() < 3:
@@ -556,7 +601,7 @@ def eval_3DLoMatch_scene(loader, matcher, regenerator, estimator, trans_evaluato
                 and diagnostics['roc_bar'] > active_param(config, 'active_tau_rho')
             )
             round2_mode = active_param(config, 'round2_mode')
-            enter_round2 = active_param(config, 'use_round2') and round2_mode != 'none' and not early_stop
+            enter_round2 = active_param(config, 'use_round2') and active_param(config, 'active_max_rounds') >= 2 and round2_mode != 'none' and not early_stop
 
             src_keypts_corr_final = r1_src_corr
             tgt_keypts_corr_final = r1_tgt_corr
@@ -618,7 +663,17 @@ def eval_3DLoMatch_scene(loader, matcher, regenerator, estimator, trans_evaluato
 
             time2 = time2.toc()
             time3.tic()
-            if enter_round2:
+            if not early_stop and active_param(config, 'use_ctc') and src_keypts_corr_final.shape[1] >= 3:
+                pred_trans, _, src_keypts_corr_final, tgt_keypts_corr_final = estimator.estimator(
+                    src_keypts_corr_final,
+                    tgt_keypts_corr_final,
+                    src_keypts,
+                    tgt_keypts,
+                    gt_trans
+                )
+                match_weights = torch.ones(src_keypts_corr_final.shape[1], dtype=src_keypts_corr_final.dtype, device=src_keypts_corr_final.device)
+
+            if not early_stop:
                 pred_trans, pred_labels, src_corr_final, tgt_corr_final, final_info = robust_weighted_estimate(
                     src_keypts_corr_final,
                     tgt_keypts_corr_final,
@@ -705,7 +760,7 @@ def eval_3DLoMatch_scene(loader, matcher, regenerator, estimator, trans_evaluato
             stats[i, 26] = float(final_info['density_drop_ratio'])
             stats[i, 27] = float(final_info['density_filter_fallback'])
             stats[i, 28] = float(diagnostics['fsv_value'])
-            stats[i, 29] = float(overlap_source == "proxy_all_ones")
+            stats[i, 29] = float(overlap_source in ("proxy_all_ones", "overlap_proxy_all_ones"))
 
             final_poses[i] = pred_trans[0].detach().cpu().numpy()
         print(fall_idx)
@@ -713,10 +768,10 @@ def eval_3DLoMatch_scene(loader, matcher, regenerator, estimator, trans_evaluato
     return stats, final_poses
 
 
-def eval_3DLoMatch(config):
+def eval_3DLoMatch_single(config):
     validate_active_config(config)
-    if config.descriptor != 'predator':
-        logging.info("Overlap_pred unavailable for this descriptor; ROC_bar uses an all-ones fallback, not a learned predicted overlap.")
+    if config.use_overlap_proxy:
+        logging.info("Overlap_pred is explicitly running in overlap_proxy mode.")
     loader = ThreeDLoMatchLoader(
         root=config.data_path,
         descriptor=config.descriptor,
@@ -724,6 +779,15 @@ def eval_3DLoMatch(config):
         num_node=config.num_node,
         use_mutual=config.use_mutual,
         free_space_root=config.free_space_root,
+        rgbd_root=config.rgbd_root,
+        overlap_pred_root=config.overlap_pred_root,
+        use_overlap_proxy=config.use_overlap_proxy,
+        use_rgbd_fsv=config.use_rgbd_fsv,
+        fsv_voxel_size=config.active_fsv_voxel_size,
+        fsv_depth_scale=config.active_fsv_depth_scale,
+        fsv_trunc_margin=config.active_fsv_trunc_margin,
+        fsv_stride=config.active_fsv_stride,
+        fsv_max_frames=config.active_fsv_max_frames,
         )
 
     matcher = Matcher_plus(
@@ -752,11 +816,12 @@ def eval_3DLoMatch(config):
     allpair_average = allpair_stats.mean(0)
     allpair_status_ndarray = np.array(allpair_stats, dtype=float)
 
-    benchmark_predator(allpair_poses, gt_folder='benchmarks/3DLoMatch')
+    if not cfg_get(config, 'max_pairs', 0) and not cfg_get(config, 'skip_benchmark', False):
+        benchmark_predator(allpair_poses, gt_folder='benchmarks/3DLoMatch')
     
     # benchmarking using the registration recall defined in DGR 
     allpair_average = allpair_stats.mean(0)
-    correct_pair_average = allpair_stats[allpair_stats[:, 0] == 1].mean(0)
+    correct_pair_average = allpair_stats[allpair_stats[:, 0] == 1].mean(0) if np.any(allpair_stats[:, 0] == 1) else np.zeros_like(allpair_average)
     logging.info(f"*" * 40)
     logging.info(f"All {allpair_stats.shape[0]} pairs, Mean Reg Recall={allpair_average[0] * 100:.2f}%, Mean Re={correct_pair_average[1]:.2f}, Mean Te={correct_pair_average[2]:.2f}， Mean FMR={allpair_average[12]* 100:.2f}")
     logging.info(f"\tMean FMR={allpair_average[12]* 100:.2f}, Mean FMR>10%={allpair_average[13]* 100:.2f}, Mean FMR>1%={allpair_average[14]* 100:.2f}")
@@ -778,7 +843,13 @@ def eval_3DLoMatch(config):
         f"round2_mode={config.round2_mode}, "
         f"lambda_prior={config.active_prior_lambda}, eta_L={config.active_eta_l}, gamma_reset={config.active_reset_gamma}, "
         f"alpha={config.active_alpha}, tau_fsv={config.active_tau_fsv}, tau_rho={config.active_tau_rho}, "
-        f"n_min={config.active_density_min}, n_max={config.active_balance_max}, K_top={config.active_reset_topk}, "
+        f"tau_overlap={config.active_overlap_threshold}, n_min={config.active_density_min}, "
+        f"n_max={config.active_balance_max}, K_top={config.active_reset_topk}, "
+        f"voxel_size={config.active_voxel_size}, final_voxel_size={config.active_final_voxel_size}, "
+        f"ransac_iters={config.active_ransac_iters}, max_rounds={config.active_max_rounds}, "
+        f"robust_kernel_c={config.active_robust_c}, epsilon_log={config.active_eps}, "
+        f"early_stop_enabled={config.use_early_stop}, density_filter_enabled={config.use_density_filter}, "
+        f"use_ctc={config.use_ctc}, use_mini_ransac_final={config.use_mini_ransac_final}, "
         f"use_o_reset={config.use_o_reset}, use_global_reset_fallback={config.use_global_reset_fallback}, "
         f"use_fsv_proxy={config.use_fsv_proxy}, use_rgbd_fsv={config.use_rgbd_fsv}, use_overlap_proxy={config.use_overlap_proxy}"
     )
@@ -787,6 +858,40 @@ def eval_3DLoMatch(config):
     # all_stats_npy = np.concatenate([v for k, v in all_stats.items()], axis=0)
 
     return allpair_stats
+
+
+def summarize_ablation_stats(label, stats):
+    avg = stats.mean(0)
+    correct = stats[stats[:, 0] == 1].mean(0) if np.any(stats[:, 0] == 1) else np.zeros_like(avg)
+    return (
+        f"{label}: Pairs={stats.shape[0]}, RR={avg[0] * 100:.2f}%, "
+        f"Re={correct[1]:.2f}, Te={correct[2]:.2f}, FMR={avg[12] * 100:.2f}%, "
+        f"Round2={avg[18] * 100:.2f}%, EarlyStop={avg[20] * 100:.2f}%, "
+        f"R1={avg[21]:.2f}, R2={avg[22]:.2f}, R2Precision={avg[23] * 100:.2f}%, "
+        f"Novel={avg[24] * 100:.2f}%, FinalCorr={avg[25]:.2f}, DensityDrop={avg[26] * 100:.2f}%"
+    )
+
+
+def ablation_config(config, mode):
+    cfg = edict(copy.deepcopy(dict(config)))
+    cfg.round2_mode = mode
+    cfg.use_round2 = mode != 'none'
+    return cfg
+
+
+def eval_3DLoMatch(config):
+    if not config.run_round2_ablation_suite:
+        return eval_3DLoMatch_single(config)
+    results = {}
+    for mode in ('none', 'original', 'random_uniform', 'weakness_guided'):
+        cfg = ablation_config(config, mode)
+        logging.info(f"{'=' * 12} {ROUND2_LABELS[mode]} {'=' * 12}")
+        stats = eval_3DLoMatch_single(cfg)
+        results[mode] = stats
+    logging.info("Round2 ablation suite summary")
+    for mode in ('none', 'original', 'random_uniform', 'weakness_guided'):
+        logging.info(summarize_ablation_stats(ROUND2_LABELS[mode], results[mode]))
+    return results
 
 
 def benchmark_predator(pred_poses, gt_folder):
@@ -874,7 +979,7 @@ if __name__ == '__main__':
     if not os.path.exists("./logs"):
         os.makedirs("./logs")
 
-    round2_suffix = config.round2_mode if cfg_get(config, 'use_round2', False) else 'round1-only'
+    round2_suffix = 'round2-suite' if config.run_round2_ablation_suite else (config.round2_mode if cfg_get(config, 'use_round2', False) else 'round1-only')
     fsv_suffix = 'rgbd_fsv' if config.use_rgbd_fsv else 'fsv_proxy'
     overlap_suffix = 'overlap_proxy' if config.use_overlap_proxy else 'overlap_pred'
     log_filename = f'logs/3DLoMatch-{config.descriptor}-{round2_suffix}-{fsv_suffix}-{overlap_suffix}.log'
@@ -887,6 +992,12 @@ if __name__ == '__main__':
     # evaluate on the test set
     stats = eval_3DLoMatch(config)
     if args.save_npy:
-        save_path = log_filename.replace('.log', '.npy')
-        np.save(save_path, stats)
-        print(f"Save the stats in {save_path}")
+        if isinstance(stats, dict):
+            for mode, value in stats.items():
+                save_path = log_filename.replace('.log', f'-{mode}.npy')
+                np.save(save_path, value)
+                print(f"Save the stats in {save_path}")
+        else:
+            save_path = log_filename.replace('.log', '.npy')
+            np.save(save_path, stats)
+            print(f"Save the stats in {save_path}")

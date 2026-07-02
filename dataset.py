@@ -6,6 +6,57 @@ import  torch
 from free_space import load_target_free_space
 
 
+def _load_npz_vector(path, keys):
+    data = np.load(path)
+    for key in keys:
+        if key in data:
+            return data[key].astype(np.float32)
+    raise KeyError(f"Missing overlap keys {keys} in {path}.")
+
+
+def load_overlap_prediction(overlap_pred_root, scene, src_id, tgt_id, src_count, tgt_count, device, allow_proxy):
+    if overlap_pred_root:
+        pair_paths = [
+            os.path.join(overlap_pred_root, scene, f"cloud_bin_{src_id}_cloud_bin_{tgt_id}_overlap.npz"),
+            os.path.join(overlap_pred_root, scene, f"cloud_bin_{src_id}_{tgt_id}_overlap.npz"),
+            os.path.join(overlap_pred_root, scene, f"{src_id}_{tgt_id}_overlap.npz"),
+        ]
+        for path in pair_paths:
+            if os.path.exists(path):
+                data = np.load(path)
+                if 'src_overlap' in data and 'tgt_overlap' in data:
+                    return (
+                        torch.from_numpy(data['src_overlap'].astype(np.float32)).to(device),
+                        torch.from_numpy(data['tgt_overlap'].astype(np.float32)).to(device),
+                        "overlap_pred"
+                    )
+                if 'overlap' in data:
+                    overlap = data['overlap'].astype(np.float32)
+                    return (
+                        torch.from_numpy(overlap[:src_count]).to(device),
+                        torch.from_numpy(overlap[src_count:src_count + tgt_count]).to(device),
+                        "overlap_pred"
+                    )
+        src_path = os.path.join(overlap_pred_root, scene, f"cloud_bin_{src_id}_overlap.npz")
+        tgt_path = os.path.join(overlap_pred_root, scene, f"cloud_bin_{tgt_id}_overlap.npz")
+        if os.path.exists(src_path) and os.path.exists(tgt_path):
+            return (
+                torch.from_numpy(_load_npz_vector(src_path, ['overlap', 'overlap_pred'])).to(device),
+                torch.from_numpy(_load_npz_vector(tgt_path, ['overlap', 'overlap_pred'])).to(device),
+                "overlap_pred"
+            )
+    if allow_proxy:
+        return (
+            torch.ones(src_count, dtype=torch.float32, device=device),
+            torch.ones(tgt_count, dtype=torch.float32, device=device),
+            "overlap_proxy_all_ones"
+        )
+    raise FileNotFoundError(
+        f"Missing predicted overlap for {scene} cloud_bin_{src_id}/cloud_bin_{tgt_id}; "
+        "set overlap_pred_root or explicitly enable use_overlap_proxy."
+    )
+
+
 class ThreeDLoader(data.Dataset):
     def __init__(self,
                  root,
@@ -116,6 +167,15 @@ class ThreeDLoMatchLoader(data.Dataset):
             use_mutual=True,
             downsample=0.03,
             free_space_root=None,
+            rgbd_root=None,
+            overlap_pred_root=None,
+            use_overlap_proxy=False,
+            use_rgbd_fsv=False,
+            fsv_voxel_size=0.05,
+            fsv_depth_scale=1000.0,
+            fsv_trunc_margin=0.05,
+            fsv_stride=8,
+            fsv_max_frames=0,
             ):
         self.root = root
         self.descriptor = descriptor
@@ -125,6 +185,15 @@ class ThreeDLoMatchLoader(data.Dataset):
         self.use_mutual = use_mutual
         self.downsample = downsample
         self.free_space_root = free_space_root
+        self.rgbd_root = rgbd_root
+        self.overlap_pred_root = overlap_pred_root
+        self.use_overlap_proxy = use_overlap_proxy
+        self.use_rgbd_fsv = use_rgbd_fsv
+        self.fsv_voxel_size = fsv_voxel_size
+        self.fsv_depth_scale = fsv_depth_scale
+        self.fsv_trunc_margin = fsv_trunc_margin
+        self.fsv_stride = fsv_stride
+        self.fsv_max_frames = fsv_max_frames
 
         with open('3DLoMatch.pkl', 'rb') as f:
             self.infos = pickle.load(f)
@@ -150,9 +219,16 @@ class ThreeDLoMatchLoader(data.Dataset):
             src_features = torch.from_numpy(src_features.astype(np.float32)).cuda()
             tgt_features = torch.from_numpy(tgt_features.astype(np.float32)).cuda()
             gt_trans = torch.from_numpy(gt_trans.astype(np.float32)).cuda()
-            src_overlap = torch.ones(src_keypts.shape[0], dtype=torch.float32, device=src_keypts.device)
-            tgt_overlap = torch.ones(tgt_keypts.shape[0], dtype=torch.float32, device=tgt_keypts.device)
-            overlap_source = "proxy_all_ones"
+            src_overlap, tgt_overlap, overlap_source = load_overlap_prediction(
+                self.overlap_pred_root,
+                scene,
+                src_id,
+                tgt_id,
+                src_keypts.shape[0],
+                tgt_keypts.shape[0],
+                src_keypts.device,
+                self.use_overlap_proxy,
+            )
 
         elif self.descriptor == 'fpfh':
             src_data = np.load(f"{self.root}/fragments/{scene}/cloud_bin_{src_id}_fpfh.npz")
@@ -169,9 +245,16 @@ class ThreeDLoMatchLoader(data.Dataset):
             src_features = torch.from_numpy(src_features.astype(np.float32)).cuda()
             tgt_features = torch.from_numpy(tgt_features.astype(np.float32)).cuda()
             gt_trans = torch.from_numpy(gt_trans.astype(np.float32)).cuda()
-            src_overlap = torch.ones(src_keypts.shape[0], dtype=torch.float32, device=src_keypts.device)
-            tgt_overlap = torch.ones(tgt_keypts.shape[0], dtype=torch.float32, device=tgt_keypts.device)
-            overlap_source = "proxy_all_ones"
+            src_overlap, tgt_overlap, overlap_source = load_overlap_prediction(
+                self.overlap_pred_root,
+                scene,
+                src_id,
+                tgt_id,
+                src_keypts.shape[0],
+                tgt_keypts.shape[0],
+                src_keypts.device,
+                self.use_overlap_proxy,
+            )
         elif self.descriptor == "predator":
             data_dict = torch.load(
                 f'{self.root}/{index}.pth')
@@ -206,7 +289,19 @@ class ThreeDLoMatchLoader(data.Dataset):
             if tgt_keypts.size(0) > self.num_node:
                 idx = torch.randperm(tgt_keypts.size(0), device=tgt_keypts.device)[:self.num_node]
                 tgt_keypts, tgt_features, tgt_overlap = tgt_keypts[idx], tgt_features[idx], tgt_overlap[idx]
-        target_free_space = load_target_free_space(self.free_space_root, scene, tgt_id, src_keypts.device)
+        target_free_space = load_target_free_space(
+            self.free_space_root,
+            self.rgbd_root,
+            scene,
+            tgt_id,
+            src_keypts.device,
+            self.fsv_voxel_size,
+            self.fsv_depth_scale,
+            self.fsv_trunc_margin,
+            self.fsv_stride,
+            self.fsv_max_frames,
+            require=self.use_rgbd_fsv,
+        )
 
         return (
             src_keypts[None],
