@@ -3,6 +3,7 @@ import pickle
 import torch.utils.data as data
 from utils.SE3 import *
 import  torch
+from free_space import load_target_free_space
 
 
 class ThreeDLoader(data.Dataset):
@@ -114,6 +115,7 @@ class ThreeDLoMatchLoader(data.Dataset):
             num_node=5000,
             use_mutual=True,
             downsample=0.03,
+            free_space_root=None,
             ):
         self.root = root
         self.descriptor = descriptor
@@ -122,6 +124,7 @@ class ThreeDLoMatchLoader(data.Dataset):
         self.num_node = num_node
         self.use_mutual = use_mutual
         self.downsample = downsample
+        self.free_space_root = free_space_root
 
         with open('3DLoMatch.pkl', 'rb') as f:
             self.infos = pickle.load(f)
@@ -149,6 +152,7 @@ class ThreeDLoMatchLoader(data.Dataset):
             gt_trans = torch.from_numpy(gt_trans.astype(np.float32)).cuda()
             src_overlap = torch.ones(src_keypts.shape[0], dtype=torch.float32, device=src_keypts.device)
             tgt_overlap = torch.ones(tgt_keypts.shape[0], dtype=torch.float32, device=tgt_keypts.device)
+            overlap_source = "proxy_all_ones"
 
         elif self.descriptor == 'fpfh':
             src_data = np.load(f"{self.root}/fragments/{scene}/cloud_bin_{src_id}_fpfh.npz")
@@ -167,6 +171,7 @@ class ThreeDLoMatchLoader(data.Dataset):
             gt_trans = torch.from_numpy(gt_trans.astype(np.float32)).cuda()
             src_overlap = torch.ones(src_keypts.shape[0], dtype=torch.float32, device=src_keypts.device)
             tgt_overlap = torch.ones(tgt_keypts.shape[0], dtype=torch.float32, device=tgt_keypts.device)
+            overlap_source = "proxy_all_ones"
         elif self.descriptor == "predator":
             data_dict = torch.load(
                 f'{self.root}/{index}.pth')
@@ -192,6 +197,7 @@ class ThreeDLoMatchLoader(data.Dataset):
                     idx = np.random.choice(idx, size=self.num_node, replace=False, p=probs)
                     tgt_keypts, tgt_features, tgt_overlap = tgt_keypts[idx], tgt_features[idx], tgt_overlap[idx]
             gt_trans = integrate_trans(data_dict['rot'], data_dict['trans']).cuda()
+            overlap_source = "predator"
 
         if not isinstance(self.num_node, str):
             if src_keypts.size(0) > self.num_node:
@@ -200,6 +206,7 @@ class ThreeDLoMatchLoader(data.Dataset):
             if tgt_keypts.size(0) > self.num_node:
                 idx = torch.randperm(tgt_keypts.size(0), device=tgt_keypts.device)[:self.num_node]
                 tgt_keypts, tgt_features, tgt_overlap = tgt_keypts[idx], tgt_features[idx], tgt_overlap[idx]
+        target_free_space = load_target_free_space(self.free_space_root, scene, tgt_id, src_keypts.device)
 
         return (
             src_keypts[None],
@@ -211,6 +218,8 @@ class ThreeDLoMatchLoader(data.Dataset):
             tgt_keypts[None],
             src_overlap[None],
             tgt_overlap[None],
+            target_free_space,
+            overlap_source,
         )
 
 

@@ -427,6 +427,59 @@ class Regenerator():
         adjusted = -guided_score
         return torch.nan_to_num(adjusted, nan=1e6, posinf=1e6, neginf=-1e6)
 
+    def guided_global_matching(self, src_point, tgt_point, src_feature, tgt_feature, guide, sampling_num):
+        eps = guide.get('eps', self.prior_eps)
+        prior_lambda = guide.get('lambda', self.prior_lambda)
+        eta_l = guide.get('eta_l', self.eta_l)
+        chunk_size = guide.get('chunk_size', 512)
+
+        source_indices = guide.get('source_candidate_indices')
+        target_indices = guide.get('target_candidate_indices')
+        if source_indices is None:
+            source_score = guide['source_prior'] * guide['source_under_support']
+            source_indices = torch.topk(source_score, k=min(sampling_num, source_score.shape[0]), largest=True).indices
+        if target_indices is None:
+            target_score = guide['target_under_support']
+            target_indices = torch.topk(target_score, k=min(tgt_point.shape[1], max(sampling_num, 1)), largest=True).indices
+
+        src_pts = src_point[0, source_indices]
+        tgt_pts = tgt_point[0, target_indices]
+        src_desc = src_feature[0, source_indices]
+        tgt_desc = tgt_feature[0, target_indices]
+
+        source_prior = guide['source_prior'][source_indices].clamp(eps, 1.0)
+        source_under = guide['source_under_support'][source_indices].clamp(eps, 1.0)
+        target_under = guide['target_under_support'][target_indices].clamp(eps, 1.0)
+        c_ref = guide['c_ref']
+        r_src = guide['r_src']
+        lever_d = torch.norm(src_pts - c_ref.view(1, 3), dim=-1) / (r_src + eps)
+        lever = 1.0 + eta_l * lever_d.clamp(0.0, 1.0)
+        source_log_prior = torch.log(source_prior) + torch.log(source_under) + torch.log(torch.maximum(lever, torch.tensor(eps, device=lever.device, dtype=lever.dtype)))
+        target_log_prior = torch.log(target_under)
+
+        best_tgt = []
+        best_scores = []
+        for start in range(0, src_desc.shape[0], chunk_size):
+            end = min(start + chunk_size, src_desc.shape[0])
+            distance = torch.sqrt(torch.clamp(2 - 2 * (src_desc[start:end] @ tgt_desc.T), min=1e-6))
+            guided_score = -distance + prior_lambda * (source_log_prior[start:end, None] + target_log_prior[None, :])
+            scores, local_idx = torch.max(guided_score, dim=1)
+            best_tgt.append(local_idx)
+            best_scores.append(scores)
+        best_tgt = torch.cat(best_tgt, dim=0)
+        best_scores = torch.cat(best_scores, dim=0)
+
+        src_corr = src_pts[None]
+        tgt_corr = tgt_pts[best_tgt][None]
+        self.last_match_weights = torch.softmax(best_scores, dim=0) * best_scores.shape[0]
+        if src_corr.shape[1] >= 10:
+            corr_idx = self.global_spatial_fitering_topk_two(src_corr, tgt_corr)
+            src_corr = src_corr[:, corr_idx, :]
+            tgt_corr = tgt_corr[:, corr_idx, :]
+            self.last_match_weights = self.last_match_weights[corr_idx]
+        final_tran = rigid_transform_3d(src_corr, tgt_corr, self.last_match_weights[None])
+        return src_corr, tgt_corr, final_tran
+
 
     def idx_selection(self, idx, points):
         """
@@ -546,7 +599,7 @@ class Regenerator():
 
         return src_keypts_best_corr, tgt_keypts_best_corr
 
-    def regenerate(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, gt_trans, knn_num=100, sampling_num=100, knn_radius=0.8, use_sampling=False, guide=None):
+    def regenerate(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, gt_trans, knn_num=100, sampling_num=100, knn_radius=0.8, use_sampling=False, guide=None, mode="local"):
         """
         Input:
             - src_key_corr: [bs, num_key_corr, 3]
@@ -562,6 +615,9 @@ class Regenerator():
         """
         self.gt_trans = gt_trans
         self.use_sampling = use_sampling
+        self.last_match_weights = None
+        if mode == "guided_global":
+            return self.guided_global_matching(src_point, tgt_point, src_feature, tgt_feature, guide, sampling_num)
         #################################
         # knn & regenerate correspondences
         #################################
@@ -569,10 +625,10 @@ class Regenerator():
         self.knn_num = min(knn_num, min(src_point.shape[1], tgt_point.shape[1]))  # knn的近邻点数量
         self.sampling_num = sampling_num  # knn的近邻点数量
 
-        # random sampling
-        sel_ind = np.random.choice(src_key_corr.shape[1], self.sampling_num)
-        src_key_corr = src_key_corr[:, sel_ind, :]
-        tgt_key_corr = tgt_key_corr[:, sel_ind, :]
+        if src_key_corr.shape[1] > self.sampling_num:
+            sel_ind = np.random.choice(src_key_corr.shape[1], self.sampling_num, replace=False)
+            src_key_corr = src_key_corr[:, sel_ind, :]
+            tgt_key_corr = tgt_key_corr[:, sel_ind, :]
 
         src_corr_knn_idx = self.knn_search(src_key_corr, src_point, self.knn_num)
         tgt_corr_knn_idx = self.knn_search(tgt_key_corr, tgt_point, self.knn_num)
