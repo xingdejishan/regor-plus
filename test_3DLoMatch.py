@@ -39,6 +39,7 @@ ROUND2_LABELS = {
 ACTIVE_REQUIRED_KEYS = (
     'use_ctc',
     'use_early_stop',
+    'use_early_stop_refinement',
     'use_round2',
     'use_o_prior',
     'use_o_reset',
@@ -73,6 +74,12 @@ ACTIVE_REQUIRED_KEYS = (
     'active_overlap_threshold',
     'active_fsv_distance',
     'active_voxel_size',
+    'active_support_target_radius',
+    'active_support_r1_radius',
+    'active_support_local_radius',
+    'active_support_min_neighbors',
+    'active_support_r1_weight',
+    'active_support_local_weight',
     'active_broad_radius',
     'active_support_radius',
     'active_final_voxel_size',
@@ -114,10 +121,20 @@ def validate_active_config(config):
         raise ValueError("round2_mode='none' requires use_round2=false.")
     if config.use_round2 and config.active_max_rounds < 2:
         raise ValueError("use_round2=True requires active_max_rounds >= 2.")
+    if config.use_early_stop and not config.use_early_stop_refinement:
+        raise ValueError("use_early_stop=true requires use_early_stop_refinement=true for early stop + mandatory refinement.")
     if config.descriptor != 'predator' and not config.use_overlap_proxy and not config.overlap_pred_root:
         raise ValueError("Non-Predator descriptors require overlap_pred_root or explicit use_overlap_proxy=true.")
     if config.active_max_rounds < 1:
         raise ValueError("active_max_rounds must be >= 1.")
+    for key in ('active_support_target_radius', 'active_support_r1_radius', 'active_support_local_radius'):
+        if getattr(config, key) <= 0:
+            raise ValueError(f"{key} must be > 0.")
+    if int(config.active_support_min_neighbors) < 1:
+        raise ValueError("active_support_min_neighbors must be >= 1.")
+    for key in ('active_support_r1_weight', 'active_support_local_weight'):
+        if getattr(config, key) < 0:
+            raise ValueError(f"{key} must be >= 0.")
 
 
 def min_dist_to_points(query, reference, chunk_size=2048):
@@ -126,6 +143,16 @@ def min_dist_to_points(query, reference, chunk_size=2048):
         end = min(start + chunk_size, query.shape[0])
         mins.append(torch.cdist(query[start:end], reference).min(dim=1)[0])
     return torch.cat(mins, dim=0)
+
+
+def count_neighbors_within(query, reference, radius, chunk_size=1024):
+    if reference.shape[0] == 0:
+        return torch.zeros(query.shape[0], device=query.device, dtype=query.dtype)
+    counts = []
+    for start in range(0, query.shape[0], chunk_size):
+        end = min(start + chunk_size, query.shape[0])
+        counts.append((torch.cdist(query[start:end], reference) < radius).float().sum(dim=1))
+    return torch.cat(counts, dim=0)
 
 
 def transform_points(points, trans):
@@ -166,6 +193,56 @@ def noisy_or(a, b):
     return 1.0 - (1.0 - a) * (1.0 - b)
 
 
+def compute_pose_conditioned_supported_overlap(src_points, tgt_points, src_overlap, nn_dist, r1_src, r1_tgt, r1_trans, config):
+    eps = active_param(config, 'active_eps')
+    threshold = active_param(config, 'active_overlap_threshold')
+    min_neighbors = max(1, int(active_param(config, 'active_support_min_neighbors')))
+    target_radius = active_param(config, 'active_support_target_radius')
+    r1_radius = active_param(config, 'active_support_r1_radius')
+    local_radius = active_param(config, 'active_support_local_radius')
+    r1_weight = active_param(config, 'active_support_r1_weight')
+    local_weight = active_param(config, 'active_support_local_weight')
+
+    pred_overlap = src_overlap.float().flatten().clamp(0.0, 1.0)
+    projected_mask = (nn_dist < threshold).float()
+    warped_src = transform_points(src_points, r1_trans)
+    target_counts = count_neighbors_within(warped_src, tgt_points, target_radius)
+    target_surface_support = (target_counts / float(min_neighbors)).clamp(0.0, 1.0)
+
+    r1_warped = transform_points(r1_src, r1_trans)
+    r1_residual = torch.norm(r1_warped - r1_tgt, dim=1)
+    inlier_mask = r1_residual < threshold
+    r1_high_conf_src = r1_src[inlier_mask]
+    r1_high_conf_tgt = r1_tgt[inlier_mask]
+    if r1_high_conf_src.shape[0] > 0:
+        r1_counts = count_neighbors_within(src_points, r1_high_conf_src, r1_radius)
+        r1_support = (r1_counts / float(min_neighbors)).clamp(0.0, 1.0)
+    else:
+        r1_support = torch.zeros_like(pred_overlap)
+
+    local_ref_mask = (projected_mask > 0) & (target_surface_support > 0)
+    local_ref = src_points[local_ref_mask]
+    local_counts = count_neighbors_within(src_points, local_ref, local_radius)
+    local_support = (local_counts / float(min_neighbors)).clamp(0.0, 1.0) * target_surface_support
+
+    weighted_r1 = (r1_weight * r1_support).clamp(0.0, 1.0)
+    weighted_local = (local_weight * local_support).clamp(0.0, 1.0)
+    support_score = noisy_or(weighted_r1, weighted_local).clamp(0.0, 1.0)
+    supported_mass = pred_overlap * projected_mask * support_score
+    denom = pred_overlap.sum() + eps
+    roc_bar = float((supported_mass.sum() / denom).clamp(0.0, 1.0).item())
+    diagnostics = {
+        'roc_bar': roc_bar,
+        'supported_overlap_mass': float(supported_mass.sum().item()),
+        'overlap_pred_mass': float(pred_overlap.sum().item()),
+        'support_score_mean': float(support_score.mean().item()),
+        'support_r1_mean': float(r1_support.mean().item()),
+        'support_local_mean': float(local_support.mean().item()),
+        'target_surface_support_mean': float(target_surface_support.mean().item()),
+    }
+    return diagnostics, r1_high_conf_src, r1_high_conf_tgt
+
+
 def build_guided_prior(src_points, tgt_points, src_overlap, tgt_overlap, r1_src, r1_tgt, r1_trans, config, topk_trans=None, target_free_space=None):
     threshold = active_param(config, 'active_overlap_threshold')
     broad_radius = active_param(config, 'active_broad_radius')
@@ -193,7 +270,18 @@ def build_guided_prior(src_points, tgt_points, src_overlap, tgt_overlap, r1_src,
     v = float(np.exp(-alpha * fsv_value))
     aoc = voxel_coverage(src_points, o_best.bool(), active_param(config, 'active_voxel_size'))
     overlap_pred = float(torch.clamp(src_overlap.mean(), min=eps, max=1.0))
-    roc_bar = min(1.0, aoc / (overlap_pred + eps))
+    coverage_ratio_proxy = min(1.0, aoc / (overlap_pred + eps))
+    supported_overlap, src_support, tgt_support = compute_pose_conditioned_supported_overlap(
+        src_points,
+        tgt_points,
+        src_overlap,
+        nn_dist,
+        r1_src,
+        r1_tgt,
+        r1_trans,
+        config,
+    )
+    roc_bar = supported_overlap['roc_bar']
 
     global_matchable = src_overlap.float().flatten()
     global_matchable = global_matchable / (global_matchable.max() + eps)
@@ -229,11 +317,7 @@ def build_guided_prior(src_points, tgt_points, src_overlap, tgt_overlap, r1_src,
     if not active_param(config, 'use_o_prior'):
         source_prior = torch.ones_like(source_prior)
 
-    r1_warped = transform_points(r1_src, r1_trans)
-    r1_residual = torch.norm(r1_warped - r1_tgt, dim=1)
-    inlier_mask = r1_residual < threshold
-    src_support = r1_src[inlier_mask]
-    tgt_support = r1_tgt[inlier_mask]
+    round1_support_inliers = src_support.shape[0]
     if src_support.shape[0] == 0:
         src_support = r1_src
         tgt_support = r1_tgt
@@ -255,6 +339,9 @@ def build_guided_prior(src_points, tgt_points, src_overlap, tgt_overlap, r1_src,
         'source_prior': source_prior,
         'source_under_support': source_under,
         'target_under_support': target_under,
+        'o_best': o_best,
+        'o_broad': o_broad,
+        'o_reset': o_reset,
         'c_ref': c_ref,
         'r_src': r_src,
         'lambda': active_param(config, 'active_prior_lambda'),
@@ -267,10 +354,17 @@ def build_guided_prior(src_points, tgt_points, src_overlap, tgt_overlap, r1_src,
         'fsv_proxy': fsv_value if fsv_metric_name == 'fsv_proxy' else np.nan,
         'rgbd_fsv': fsv_value if fsv_metric_name == 'rgbd_fsv' else np.nan,
         'aoc': aoc,
+        'coverage_ratio_proxy': coverage_ratio_proxy,
         'roc_bar': roc_bar,
+        'supported_overlap_mass': supported_overlap['supported_overlap_mass'],
+        'overlap_pred_mass': supported_overlap['overlap_pred_mass'],
+        'support_score_mean': supported_overlap['support_score_mean'],
+        'support_r1_mean': supported_overlap['support_r1_mean'],
+        'support_local_mean': supported_overlap['support_local_mean'],
+        'target_surface_support_mean': supported_overlap['target_surface_support_mean'],
         'overlap_pred': overlap_pred,
         'confidence': v,
-        'round1_inliers': int(inlier_mask.sum().item()),
+        'round1_inliers': int(round1_support_inliers),
     }
     return guide, diagnostics
 
@@ -519,7 +613,7 @@ def eval_3DLoMatch_scene(loader, matcher, regenerator, estimator, trans_evaluato
         num_pair = min(num_pair, int(max_pairs))
     final_poses = np.zeros([num_pair, 4, 4])
 
-    stats = np.zeros([num_pair, 30])
+    stats = np.zeros([num_pair, 36])
     data_timer, model_timer = Timer(), Timer()
     with torch.no_grad():
         error_pair = []
@@ -673,7 +767,8 @@ def eval_3DLoMatch_scene(loader, matcher, regenerator, estimator, trans_evaluato
                 )
                 match_weights = torch.ones(src_keypts_corr_final.shape[1], dtype=src_keypts_corr_final.dtype, device=src_keypts_corr_final.device)
 
-            if not early_stop:
+            run_final_refinement = (not early_stop) or active_param(config, 'use_early_stop_refinement')
+            if run_final_refinement:
                 pred_trans, pred_labels, src_corr_final, tgt_corr_final, final_info = robust_weighted_estimate(
                     src_keypts_corr_final,
                     tgt_keypts_corr_final,
@@ -761,6 +856,12 @@ def eval_3DLoMatch_scene(loader, matcher, regenerator, estimator, trans_evaluato
             stats[i, 27] = float(final_info['density_filter_fallback'])
             stats[i, 28] = float(diagnostics['fsv_value'])
             stats[i, 29] = float(overlap_source in ("proxy_all_ones", "overlap_proxy_all_ones"))
+            stats[i, 30] = float(diagnostics['roc_bar'])
+            stats[i, 31] = float(diagnostics['coverage_ratio_proxy'])
+            stats[i, 32] = float(diagnostics['support_score_mean'])
+            stats[i, 33] = float(diagnostics['support_r1_mean'])
+            stats[i, 34] = float(diagnostics['support_local_mean'])
+            stats[i, 35] = float(diagnostics['target_surface_support_mean'])
 
             final_poses[i] = pred_trans[0].detach().cpu().numpy()
         print(fall_idx)
@@ -837,6 +938,8 @@ def eval_3DLoMatch_single(config):
     logging.info(f"\tDensity filtering fallback rate: {allpair_average[27] * 100:.2f}%")
     logging.info(f"\tMean {('rgbd_fsv' if config.use_rgbd_fsv else 'fsv_proxy')}: {allpair_average[28]:.4f}")
     logging.info(f"\tOverlap proxy rate: {allpair_average[29] * 100:.2f}%")
+    logging.info(f"\tMean supported ROC_bar: {allpair_average[30]:.4f}, coverage_ratio_proxy: {allpair_average[31]:.4f}")
+    logging.info(f"\tSupport score mean: {allpair_average[32]:.4f}, R1 support: {allpair_average[33]:.4f}, local support: {allpair_average[34]:.4f}, target surface support: {allpair_average[35]:.4f}")
     logging.info(f"\tAblation setting: {ROUND2_LABELS[config.round2_mode]}")
     logging.info(
         "\tActive params: "
@@ -846,9 +949,12 @@ def eval_3DLoMatch_single(config):
         f"tau_overlap={config.active_overlap_threshold}, n_min={config.active_density_min}, "
         f"n_max={config.active_balance_max}, K_top={config.active_reset_topk}, "
         f"voxel_size={config.active_voxel_size}, final_voxel_size={config.active_final_voxel_size}, "
+        f"support_target_radius={config.active_support_target_radius}, support_r1_radius={config.active_support_r1_radius}, "
+        f"support_local_radius={config.active_support_local_radius}, support_min_neighbors={config.active_support_min_neighbors}, "
+        f"support_r1_weight={config.active_support_r1_weight}, support_local_weight={config.active_support_local_weight}, "
         f"ransac_iters={config.active_ransac_iters}, max_rounds={config.active_max_rounds}, "
         f"robust_kernel_c={config.active_robust_c}, epsilon_log={config.active_eps}, "
-        f"early_stop_enabled={config.use_early_stop}, density_filter_enabled={config.use_density_filter}, "
+        f"early_stop_enabled={config.use_early_stop}, early_stop_refinement={config.use_early_stop_refinement}, density_filter_enabled={config.use_density_filter}, "
         f"use_ctc={config.use_ctc}, use_mini_ransac_final={config.use_mini_ransac_final}, "
         f"use_o_reset={config.use_o_reset}, use_global_reset_fallback={config.use_global_reset_fallback}, "
         f"use_fsv_proxy={config.use_fsv_proxy}, use_rgbd_fsv={config.use_rgbd_fsv}, use_overlap_proxy={config.use_overlap_proxy}"

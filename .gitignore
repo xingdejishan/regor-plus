@@ -5,3 +5,15 @@ data/
 snapshot/
 external/
 3dmatch/
+3dmatch_raw/
+outputs/
+*.zip
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.npy
+*.npz
+*.pkl
+*.log
+*.tmp

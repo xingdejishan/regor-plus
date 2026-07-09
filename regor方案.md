@@ -7,12 +7,12 @@
 核心思想：
 
 > Round 1 先用 GMM 生成候选匹配与候选位姿；  
-> 再用 FSV 判断当前位姿是否物理可信，用归一化覆盖率判断当前重叠区支持是否充分；  
+> 再用 FSV 判断当前位姿是否物理可信，用 pose-conditioned supported ROC 判断当前重叠区支持是否充分；  
 > 若当前解已经可信，则早停；若不可信或支持不足，则进入 Round 2 主动再生成。
 
 最终主张：
 
-> REGOR 负责生成候选匹配；FSV 与归一化覆盖率负责判断是否需要继续生成；包容式 overlap prior 负责决定第二轮去哪生成。
+> REGOR 负责生成候选匹配；FSV 与 pose-conditioned supported ROC 负责判断是否需要继续生成；包容式 overlap prior 负责决定第二轮去哪生成。
 
 ---
 
@@ -158,30 +158,83 @@ AOC 的问题：
 
 > 在 3DLoMatch 中真实 overlap 只有 10%–30%，所以 AOC 天然偏低，不能直接用于早停判断。
 
-### 4.3 归一化覆盖率
+### 4.3 ROC_bar：pose-conditioned supported overlap
 
-为避免低重叠样本永远无法早停，使用 predicted overlap 对 AOC 进行归一化：
+`ROC_bar` 不应该只是 AOC 的归一化覆盖率。
+在 redkitchen 这类重复室内结构里，错误位姿也可能把 source 点投到墙面、柜面、桌面附近；如果只问“投过去附近有没有 target 点”，会把错误位姿误判为覆盖充分。
+
+因此 `ROC_bar` 必须定义为 pose-conditioned supported overlap：
 
 ```math
 \bar{ROC}(T)
 =
-\min
+\operatorname{clip}
 \left(
-1.0,
-\frac{AOC(T)}
-{Overlap_{\text{pred}}+\epsilon}
+\frac{
+\sum_i
+O_{\text{pred}}(p_i)\cdot
+\mathbb{I}
+\left[
+d(Tp_i, P_t)<\tau_d
+\right]\cdot
+s_i(T)
+}{
+\sum_i O_{\text{pred}}(p_i)+\epsilon
+},
+0,
+1
 \right)
 ```
 
-含义：
+其中：
 
-> 当前内点覆盖是否已经接近该点云对理论上可能重叠的范围。
+- `O_pred(p_i)`：外部 overlap predictor 对 source 点的预测重叠先验。
+- `d(Tp_i, P_t)`：source 点经候选位姿变换后到 target 点云的最近距离。
+- `tau_d`：target surface proximity 阈值，默认等于 `tau_overlap`。
+- `s_i(T)`：位姿条件正向几何支持，取值 `[0,1]`。
+
+`s_i(T)` 不能恒等于 1。它至少应包含一种正向几何支持，例如：
+
+```text
+对应点残差是否小
+局部邻域是否有 target surface support
+法向是否一致
+是否属于 Round1 高置信 correspondence 支持区域
+是否被多个局部点一致支持
+```
+
+当前实现采用：
+
+```math
+s_i(T)
+=
+\operatorname{NoisyOR}
+\left(
+w_{r1}\cdot S_{r1}(p_i),
+w_{local}\cdot S_{local}(p_i)
+\right)
+```
+
+其中：
+
+- `S_r1(p_i)`：`p_i` 是否落在 Round1 refined pose 的高置信 correspondence source 支持区域附近。
+- `S_local(p_i)`：`p_i` 附近是否有多个 source 点也在当前位姿下获得 target surface support。
+- 当前版本没有使用 normal consistency；如果加入可靠法向，应作为额外支持项进入 `s_i(T)`。
+
+旧的：
+
+```math
+\frac{AOC(T)}
+{Overlap_{\text{pred}}+\epsilon}
+```
+
+只能作为 `coverage_ratio_proxy` 诊断量，不能再用于 early stop 或 `O(p)` 的扩张系数。
 
 性质：
 
 - 越高越好。
-- 它不是绝对覆盖率，而是相对于 predicted overlap 的支持度。
-- 它用于判断当前解是否有足够空间支撑。
+- 它不是绝对覆盖率，也不是简单归一化覆盖率。
+- 它用于判断当前位姿下 predicted-overlap source 区域是否被 target surface 和当前 correspondence / 局部几何共同支持。
 
 ---
 
@@ -198,7 +251,8 @@ FSV(T_{\text{best}}) < \tau_{fsv}
 若满足：
 
 ```text
-return T_best
+skip Round 2
+enter mandatory final refinement with C_R1
 ```
 
 否则：
@@ -207,11 +261,27 @@ return T_best
 enter Round 2
 ```
 
+本方案采用：
+
+```text
+early stop + mandatory refinement
+```
+
+即 early stop 只表示“停止主动再生成 / 不进入 Round 2”，不表示直接输出 `T_best`。  
+满足 early stop 后仍必须进入最终估计模块：
+
+```text
+density filtering
+→ voxel-balanced weighting
+→ robust weighted SVD 或 mini-RANSAC
+→ return T_refined
+```
+
 解释：
 
 - FSV 低：当前位姿没有明显违反自由空间。
-- 归一化覆盖率高：当前位姿已经被足够的重叠区域支持。
-- 两者同时满足，说明没有必要进入第二轮。
+- `ROC_bar` 高：当前位姿下 predicted-overlap 区域已经获得 target surface 与 correspondence / 局部几何支持。
+- 两者同时满足，说明没有必要进入第二轮主动生成，但仍需要最终 refinement 稳定位姿。
 
 这把原始 REGOR 的固定两轮改成了按需迭代。
 
@@ -701,12 +771,13 @@ Round 1:
 
 Diagnosis:
 6. Compute FSV(T_best)
-7. Compute AOC(T_best)
-8. Compute ROC_bar(T_best)
+7. Compute AOC(T_best) as diagnostic coverage_ratio_proxy only
+8. Compute pose-conditioned supported ROC_bar(T_best)
 
 Early Stop:
 9. If FSV(T_best) < τ_fsv and ROC_bar(T_best) > τ_ρ:
-       return T_best
+       skip Round 2
+       go to Final with C_R1 and T_best
 
 Round 2:
 10. Compute v(T)=exp(-α·FSV(T))
@@ -720,10 +791,11 @@ Round 2:
 
 Final:
 18. Merge C_R1 ∪ C_R2
+    If early stop: use C_R1 only
 19. Density filtering
 20. Voxel-balanced weighting
 21. Robust weighted SVD / mini-RANSAC
-22. Output T_final
+22. Output T_refined / T_final
 23. Optional: final FSV-based failure detection
 ```
 
@@ -930,4 +1002,4 @@ mini-RANSAC
 
 ## 14. 一句话总结
 
-本方案将 REGOR 的固定两轮 correspondence regeneration 改为 diagnosis-guided active regeneration：用 FSV 判断当前位姿是否物理可信，用归一化覆盖率判断当前重叠区支持是否充分，并通过包容式 overlap prior、无惩罚基线的自适应几何力臂和 source-target 双向欠支持权重，引导第二轮 GMM 在可靠区域中主动补充高价值匹配。
+本方案将 REGOR 的固定两轮 correspondence regeneration 改为 diagnosis-guided active regeneration：用 FSV 判断当前位姿是否物理可信，用 pose-conditioned supported ROC 判断当前重叠区支持是否充分，并通过包容式 overlap prior、无惩罚基线的自适应几何力臂和 source-target 双向欠支持权重，引导第二轮 GMM 在可靠区域中主动补充高价值匹配。
