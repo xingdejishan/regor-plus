@@ -253,6 +253,14 @@ def evaluate(args):
             )
             r1_topk_trans = generate_r1_topk_transforms(r1_src_corr, r1_tgt_corr, r1_trans_initial, config)
             t_best, r1_topk_trans, _ = select_best_r1_transform(r1_src_corr, r1_tgt_corr, r1_topk_trans, config)
+            r1_only_weights = torch.ones(r1_src_corr.shape[1], dtype=r1_src_corr.dtype, device=r1_src_corr.device)
+            t_r1_final, _, _, _, r1_only_final_info = robust_weighted_estimate(
+                r1_src_corr,
+                r1_tgt_corr,
+                t_best,
+                config,
+                match_weights=r1_only_weights,
+            )
             guide, diagnostics = build_guided_prior(
                 src_keypts[0],
                 tgt_keypts[0],
@@ -350,6 +358,7 @@ def evaluate(args):
             percentile_count = max(1, int(np.ceil(source_score.shape[0] * args.top_percentile / 100.0)))
             percentile_idx = torch.topk(source_score, k=percentile_count, largest=True).indices
             actual_source = r2_src_corr[0]
+            r2_seed_gt_overlap = gt_overlap_mask(r2_seed_src[0], tgt_keypts[0], gt_trans, config.inlier_threshold)
             actual_gt_overlap = gt_overlap_mask(actual_source, tgt_keypts[0], gt_trans, config.inlier_threshold)
 
             if "source_candidate_indices" in guide:
@@ -389,6 +398,12 @@ def evaluate(args):
 
             t_best_success, t_best_re, t_best_te = pose_success(t_best, gt_trans, config.re_thre, config.te_thre)
             t_r1_success, t_r1_re, t_r1_te = pose_success(t_best, gt_trans, config.re_thre, config.te_thre)
+            t_r1_only_final_success, t_r1_only_final_re, t_r1_only_final_te = pose_success(
+                t_r1_final,
+                gt_trans,
+                config.re_thre,
+                config.te_thre,
+            )
             t_r2_success, t_r2_re, t_r2_te = pose_success(t_r2, gt_trans, config.re_thre, config.te_thre)
             t_final_success, t_final_re, t_final_te = pose_success(t_final, gt_trans, config.re_thre, config.te_thre)
 
@@ -409,6 +424,8 @@ def evaluate(args):
                 "o_top_percentile": float(args.top_percentile),
                 "o_top_percentile_count": int(percentile_idx.numel()),
                 "o_top_percentile_gt_overlap_rate": bool_mean(gt_src_overlap[percentile_idx]),
+                "r2_seed_source_count": int(r2_seed_src.shape[1]),
+                "r2_seed_source_gt_overlap_rate": bool_mean(r2_seed_gt_overlap),
                 "r2_sampled_source_count": int(actual_source.shape[0]),
                 "r2_sampled_source_gt_overlap_rate": bool_mean(actual_gt_overlap),
                 "r2_corr_count": r2_corr_count,
@@ -418,6 +435,10 @@ def evaluate(args):
                 "t_r1_success": t_r1_success,
                 "t_r1_re": t_r1_re,
                 "t_r1_te": t_r1_te,
+                "t_r1_only_final_success": t_r1_only_final_success,
+                "t_r1_only_final_re": t_r1_only_final_re,
+                "t_r1_only_final_te": t_r1_only_final_te,
+                "t_r1_only_final_used_count": int(r1_only_final_info["final_used_count"]),
                 "t_r2_only_success": t_r2_success,
                 "t_r2_only_re": t_r2_re,
                 "t_r2_only_te": t_r2_te,
