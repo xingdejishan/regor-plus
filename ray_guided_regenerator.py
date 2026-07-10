@@ -127,16 +127,17 @@ class RayGuidedRegenerator:
         residual = torch.relu(constraints.b - constraints.G @ delta)
         return float(-(residual * constraints.weights).mean().item())
 
-    def _select_seed_groups(self, pairs, scores, src_points, tgt_points, group_count, explore_count, offset=0):
+    def _select_seed_groups(self, pairs, scores, src_points, tgt_points, group_count, offset=0, used_anchor_pairs=None, used_group_keys=None):
         order = torch.argsort(scores, descending=True)
         if order.numel():
             order = torch.roll(order, shifts=-int(offset) % order.numel())
         groups = []
-        used = set()
-        for rank, index in enumerate(order.tolist()):
+        used_anchor_pairs = set() if used_anchor_pairs is None else used_anchor_pairs
+        used_group_keys = set() if used_group_keys is None else used_group_keys
+        for index in order.tolist():
             pair = pairs[index]
-            key = (int(pair[0]), int(pair[1]))
-            if key in used:
+            anchor_key = (int(pair[0]), int(pair[1]))
+            if anchor_key in used_anchor_pairs:
                 continue
             distance_src = torch.linalg.norm(src_points[pairs[:, 0]] - src_points[pair[0]], dim=1)
             distance_tgt = torch.linalg.norm(tgt_points[pairs[:, 1]] - tgt_points[pair[1]], dim=1)
@@ -144,12 +145,17 @@ class RayGuidedRegenerator:
             if compatible.numel() < 3:
                 continue
             compatible = compatible[torch.argsort(scores[compatible], descending=True)]
-            group = compatible[:min(6, compatible.numel())]
-            group_key = tuple((int(pairs[item, 0]), int(pairs[item, 1])) for item in group.tolist())
-            if group_key in used:
+            non_anchor = compatible[compatible != index]
+            group = torch.cat([
+                torch.tensor([index], dtype=torch.long, device=pairs.device),
+                non_anchor[:max(0, min(6, compatible.numel()) - 1)],
+            ])
+            group_key = tuple(sorted((int(pairs[item, 0]), int(pairs[item, 1])) for item in group.tolist()))
+            if group_key in used_group_keys:
                 continue
-            used.add(group_key)
-            groups.append((group, "independent" if rank < explore_count else "ray_guided"))
+            used_anchor_pairs.add(anchor_key)
+            used_group_keys.add(group_key)
+            groups.append(group)
             if len(groups) >= group_count:
                 break
         return groups
@@ -213,9 +219,15 @@ class RayGuidedRegenerator:
         output_count = min(int(candidate_count), self.seed_group_count) if self.seed_group_count is not None else int(candidate_count)
         explore_count = int(round(output_count * self.independent_explore_fraction))
         guided_count = max(0, output_count - explore_count)
-        pool_count = max(output_count, self.seed_group_count or output_count)
-        guided_groups = self._select_seed_groups(pairs, descriptor_scores, src, tgt, pool_count, 0, round_id * max(1, candidate_count))
-        independent_groups = self._select_seed_groups(pairs, descriptor_scores, src, tgt, pool_count, 0, round_id * max(1, explore_count))
+        used_anchor_pairs, used_group_keys = set(), set()
+        guided_groups = self._select_seed_groups(
+            pairs, descriptor_scores, src, tgt, guided_count,
+            round_id * max(1, candidate_count), used_anchor_pairs, used_group_keys,
+        ) if guided_count else []
+        independent_groups = self._select_seed_groups(
+            pairs, descriptor_scores, src, tgt, explore_count,
+            round_id * max(1, explore_count), used_anchor_pairs, used_group_keys,
+        ) if explore_count else []
 
         def score_group(group, mode):
             group_pairs = pairs[group]
@@ -235,8 +247,8 @@ class RayGuidedRegenerator:
                 "mode": mode,
             }
 
-        guided_records = [score_group(group, "ray_guided") for group, _ in guided_groups]
-        independent_records = [score_group(group, "independent") for group, _ in independent_groups]
+        guided_records = [score_group(group, "ray_guided") for group in guided_groups]
+        independent_records = [score_group(group, "independent") for group in independent_groups]
         guided_records.sort(key=lambda record: record["score"], reverse=True)
         independent_records.sort(key=lambda record: record["descriptor_score"], reverse=True)
         selected_records = guided_records[:guided_count] + independent_records[:explore_count]

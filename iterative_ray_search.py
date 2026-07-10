@@ -26,12 +26,17 @@ class HypothesisArchive:
     rejected_this_round: list = field(default_factory=list)
     _next_id: int = 0
 
-    def add(self, hypotheses):
+    def assign_ids(self, hypotheses):
         for hypothesis in hypotheses:
             if hypothesis.hypothesis_id < 0:
                 hypothesis.hypothesis_id = self._next_id
                 self._next_id += 1
-            self.hypotheses.append(hypothesis)
+            else:
+                self._next_id = max(self._next_id, hypothesis.hypothesis_id + 1)
+
+    def add(self, hypotheses):
+        self.assign_ids(hypotheses)
+        self.hypotheses.extend(hypotheses)
 
     @property
     def best_pose(self):
@@ -46,9 +51,15 @@ class HypothesisArchive:
 class SearchResult:
     pose: torch.Tensor
     archive: HypothesisArchive
+    raw_archive: HypothesisArchive
     round_logs: list
     candidate_logs: list
+    raw_candidate_logs: list
     timings: dict
+
+    @property
+    def refined_archive(self):
+        return self.archive
 
 
 class RaySelector:
@@ -56,6 +67,9 @@ class RaySelector:
         self.active_ray_count = int(active_ray_count)
         self.variance_min_observers = int(variance_min_observers)
         self._uses = {}
+
+    def reset(self):
+        self._uses.clear()
 
     @staticmethod
     def _codes(keys, reference):
@@ -110,11 +124,23 @@ class RaySelector:
             selected.extend(index for index in order.tolist() if index not in set(selected))
         return torch.tensor(selected[:count], device=order.device, dtype=torch.long)
 
+    @staticmethod
+    def _comparison_signatures(archive, direction):
+        incumbent = archive.incumbent
+        if incumbent is None:
+            return [ray_signature(item.search_evaluation[direction]) for item in archive.hypotheses if hasattr(item, "search_evaluation")]
+        return [
+            ray_signature(item.search_evaluation[direction])
+            for item in archive.hypotheses
+            if item is not incumbent
+            and hasattr(item, "search_evaluation")
+        ]
+
     def select(self, search_evaluation, archive):
         target_signature = ray_signature(search_evaluation["target"])
         source_signature = ray_signature(search_evaluation["source"])
-        target_comparisons = [ray_signature(item.search_evaluation["target"]) for item in archive.hypotheses if hasattr(item, "search_evaluation")]
-        source_comparisons = [ray_signature(item.search_evaluation["source"]) for item in archive.hypotheses if hasattr(item, "search_evaluation")]
+        target_comparisons = self._comparison_signatures(archive, "target")
+        source_comparisons = self._comparison_signatures(archive, "source")
         target_order = self._rank(target_signature, target_comparisons)
         source_order = self._rank(source_signature, source_comparisons)
         target_count = min((self.active_ray_count + 1) // 2, target_order.numel())
@@ -185,25 +211,36 @@ class IterativeRaySearch:
         hypothesis.search_insufficient_evidence = search.insufficient_evidence
         return search
 
-    def _prescore(self, hypotheses, inputs, include_validation=False):
-        if not hypotheses:
-            return
-        poses = torch.cat([item.pose for item in hypotheses], dim=0)
-        search_scores = self.validator.evaluate_batch(
-            poses, inputs["src_points"], inputs["tgt_points"], inputs["source_rays"], inputs["target_rays"], 1,
+    @staticmethod
+    def _raw_snapshot(hypothesis):
+        return PoseHypothesis(
+            hypothesis_id=hypothesis.hypothesis_id,
+            parent_id=hypothesis.parent_id,
+            round_id=hypothesis.round_id,
+            pose_raw=hypothesis.pose_raw.detach().clone(),
+            pose_local_refined=hypothesis.pose_raw.detach().clone(),
+            src_corr=hypothesis.src_corr.detach().clone(),
+            tgt_corr=hypothesis.tgt_corr.detach().clone(),
+            correspondence_scores=hypothesis.correspondence_scores.detach().clone(),
+            seed_ids=hypothesis.seed_ids.detach().clone(),
+            generation_mode=hypothesis.generation_mode,
+            descriptor_score=hypothesis.descriptor_score,
+            predicted_escape_score=hypothesis.predicted_escape_score,
+            search_ray_score=hypothesis.search_ray_score,
+            search_free_violation=hypothesis.search_free_violation,
+            validation_ray_score=hypothesis.validation_ray_score,
+            surface_support=hypothesis.surface_support,
+            valid_observation_count=hypothesis.valid_observation_count,
+            valid_observation_ratio=hypothesis.valid_observation_ratio,
+            frame_coverage=hypothesis.frame_coverage,
+            bidirectional_consistency=hypothesis.bidirectional_consistency,
+            nearest_history_distance=hypothesis.nearest_history_distance,
+            signature_similarity=hypothesis.signature_similarity,
+            search_insufficient_evidence=hypothesis.search_insufficient_evidence,
+            insufficient_evidence=hypothesis.insufficient_evidence,
+            rejected_by_history=hypothesis.rejected_by_history,
+            ray_signature=detach_ray_signature(hypothesis.ray_signature) if hypothesis.ray_signature is not None else None,
         )
-        validation_scores = self.validator.evaluate_batch(
-            poses, inputs["src_points"], inputs["tgt_points"], inputs["source_rays"], inputs["target_rays"], 0,
-        ) if include_validation else [None] * len(hypotheses)
-        for hypothesis, search, validation in zip(hypotheses, search_scores, validation_scores):
-            hypothesis.search_ray_score = search["score"]
-            hypothesis.search_free_violation = search["free_violation"]
-            hypothesis.search_insufficient_evidence = search["insufficient_evidence"]
-            if validation is not None:
-                hypothesis.validation_ray_score = validation["score"]
-                hypothesis.surface_support = validation["surface_support"]
-                hypothesis.valid_observation_count = validation["valid_observation_count"]
-                hypothesis.insufficient_evidence = validation["insufficient_evidence"]
 
     def _nms(self, hypotheses, score_name="validation_ray_score"):
         unique, duplicates = [], []
@@ -242,8 +279,8 @@ class IterativeRaySearch:
             "valid_observation_ratio": hypothesis.valid_observation_ratio,
             "nearest_history_distance": hypothesis.nearest_history_distance,
             "signature_similarity": hypothesis.signature_similarity,
-            "has_sufficient_evidence": int(hypothesis.has_sufficient_evidence),
-            "insufficient_evidence": int(hypothesis.insufficient_evidence),
+            "search_insufficient_evidence": int(hypothesis.search_insufficient_evidence),
+            "validation_insufficient_evidence": int(hypothesis.insufficient_evidence),
             "pose_raw": hypothesis.pose_raw[0].detach().cpu().tolist(),
             "pose_local_refined": hypothesis.pose_local_refined[0].detach().cpu().tolist(),
             "pose_merge_refined": None,
@@ -252,8 +289,9 @@ class IterativeRaySearch:
 
     def run(self, initial_pose, pair_inputs, time_budget_seconds=None, initial_hypothesis=None):
         started = time.perf_counter()
+        self.ray_selector.reset()
         budget = self.config.search_time_budget_seconds if time_budget_seconds is None else float(time_budget_seconds)
-        archive, memory = HypothesisArchive(), ConstraintMemory()
+        archive, raw_archive, memory = HypothesisArchive(), HypothesisArchive(), ConstraintMemory()
         scoring_inputs = pair_inputs
         if self.config.method == "shuffled_ray":
             if "shuffled_source_rays" not in pair_inputs or "shuffled_target_rays" not in pair_inputs:
@@ -273,14 +311,18 @@ class IterativeRaySearch:
         )
         self.regenerator.prepare_descriptor_cache(pair_inputs["src_features"], pair_inputs["tgt_features"])
         self._score(r1, scoring_inputs)
+        raw_archive.assign_ids([r1])
+        raw_archive.add([self._raw_snapshot(r1)])
         archive.add([r1])
         archive.incumbent = r1
-        round_logs, candidate_logs = [], [self._candidate_log(pair_inputs.get("pair_id", ""), r1)]
+        round_logs = []
+        candidate_logs = [{**self._candidate_log(pair_inputs.get("pair_id", ""), r1), "archive_stage": "refined"}]
+        raw_candidate_logs = [{**self._candidate_log(pair_inputs.get("pair_id", ""), r1), "archive_stage": "raw"}]
         stagnation = 0
         timings = {"constraint_time": 0.0, "candidate_generation_time": 0.0, "candidate_validation_time": 0.0, "total_time": 0.0}
         if self.config.method == "r1_only":
             timings["total_time"] = time.perf_counter() - started
-            return SearchResult(archive.best_pose, archive, round_logs, candidate_logs, timings)
+            return SearchResult(archive.best_pose, archive, raw_archive, round_logs, candidate_logs, raw_candidate_logs, timings)
         for round_id in range(1, self.config.search_max_rounds + 1):
             if budget > 0 and time.perf_counter() - started >= budget:
                 break
@@ -316,7 +358,7 @@ class IterativeRaySearch:
             )
             timings["candidate_generation_time"] += time.perf_counter() - generation_started
             validation_started = time.perf_counter()
-            self._prescore(proposals, scoring_inputs)
+            raw_archive.assign_ids(proposals)
             for proposal in proposals:
                 self._score_search(proposal, scoring_inputs)
                 repeated, distance, similarity = (False, float("inf"), 0.0) if self.config.method == "repeated_regor" else memory.repeated_basin(
@@ -326,6 +368,12 @@ class IterativeRaySearch:
                 proposal.nearest_history_distance = distance
                 proposal.signature_similarity = similarity
                 proposal.rejected_by_history = repeated
+            raw_history_rejected_count = sum(item.rejected_by_history for item in proposals)
+            raw_archive.add([self._raw_snapshot(proposal) for proposal in proposals])
+            raw_candidate_logs.extend(
+                {**self._candidate_log(pair_inputs.get("pair_id", ""), proposal), "archive_stage": "raw"}
+                for proposal in proposals
+            )
             raw_unique, _ = self._nms(proposals, score_name="search_ray_score")
             refinement_pool = [
                 proposal for proposal in raw_unique
@@ -376,7 +424,10 @@ class IterativeRaySearch:
                     translation_radius=self.config.history_translation_radius,
                 ))
             timings["candidate_validation_time"] += time.perf_counter() - validation_started
-            candidate_logs.extend(self._candidate_log(pair_inputs.get("pair_id", ""), proposal) for proposal in unique)
+            candidate_logs.extend(
+                {**self._candidate_log(pair_inputs.get("pair_id", ""), proposal), "archive_stage": "refined"}
+                for proposal in unique
+            )
             round_logs.append({
                 "pair_id": pair_inputs.get("pair_id", ""),
                 "round_id": round_id,
@@ -391,9 +442,12 @@ class IterativeRaySearch:
                 "constraint_rank": constraints.rank,
                 "constraint_condition_number": constraints.condition_number,
                 "generated_candidate_count": len(proposals),
-                "unique_candidate_count": len(unique),
+                "raw_unique_candidate_count": len(raw_unique),
                 "pre_refine_candidate_count": len(refinement_pool),
-                "history_rejected_count": len(archive.rejected_this_round),
+                "refined_unique_candidate_count": len(unique),
+                "rejected_by_existing_history_count": raw_history_rejected_count,
+                "rejected_by_existing_history_after_refinement_count": sum(item.rejected_by_history for item in refinement_pool),
+                "new_negative_basin_count": len(archive.rejected_this_round),
                 "independent_candidate_count": sum(item.generation_mode == "independent" for item in unique),
                 "improved": int(improved),
                 "history_basin_count": len(memory),
@@ -403,7 +457,7 @@ class IterativeRaySearch:
             if self.config.enable_adaptive_stop and stagnation >= self.config.stagnation_rounds:
                 break
         timings["total_time"] = time.perf_counter() - started
-        return SearchResult(archive.best_pose, archive, round_logs, candidate_logs, timings)
+        return SearchResult(archive.best_pose, archive, raw_archive, round_logs, candidate_logs, raw_candidate_logs, timings)
 
 
 ConstraintBuilder = RayConstraintBuilder
