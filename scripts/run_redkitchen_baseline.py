@@ -72,7 +72,6 @@ def evaluate_pair(row, infos, args, modules, device):
             tgt_keypts,
             src_features,
             tgt_features,
-            gt_trans,
         )
         if src_filtered.shape[1] == 0:
             src_filtered = src_corr
@@ -85,7 +84,6 @@ def evaluate_pair(row, infos, args, modules, device):
             tgt_keypts,
             src_features,
             tgt_features,
-            gt_trans,
             knn_num=args.round1_knn,
             sampling_num=args.round1_sampling,
         )
@@ -97,7 +95,6 @@ def evaluate_pair(row, infos, args, modules, device):
                 tgt_keypts,
                 src_features,
                 tgt_features,
-                gt_trans,
                 knn_num=args.round2_knn,
                 sampling_num=args.round2_sampling,
             )

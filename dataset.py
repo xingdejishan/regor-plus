@@ -3,7 +3,8 @@ import pickle
 import torch.utils.data as data
 from utils.SE3 import *
 import  torch
-from free_space import load_target_free_space
+from ray_evidence import build_ray_bundle
+from registration_pair import RegistrationPair
 
 
 def _load_npz_vector(path, keys):
@@ -176,6 +177,11 @@ class ThreeDLoMatchLoader(data.Dataset):
             fsv_trunc_margin=0.05,
             fsv_stride=8,
             fsv_max_frames=0,
+            ray_manifest="",
+            ray_stride=8,
+            ray_search_fraction=0.7,
+            ray_min_depth=0.1,
+            ray_max_depth=8.0,
             ):
         self.root = root
         self.descriptor = descriptor
@@ -194,11 +200,37 @@ class ThreeDLoMatchLoader(data.Dataset):
         self.fsv_trunc_margin = fsv_trunc_margin
         self.fsv_stride = fsv_stride
         self.fsv_max_frames = fsv_max_frames
+        self.ray_manifest = ray_manifest
+        self.ray_stride = ray_stride
+        self.ray_search_fraction = ray_search_fraction
+        self.ray_min_depth = ray_min_depth
+        self.ray_max_depth = ray_max_depth
+        self._ray_cache = {}
 
         with open('3DLoMatch.pkl', 'rb') as f:
             self.infos = pickle.load(f)
 
-    def get_data(self, index):
+    def _ray_bundle(self, scene, fragment_id, device):
+        if not self.ray_manifest:
+            raise ValueError("ThreeDLoMatchLoader.get_pair requires ray_manifest.")
+        key = (scene, str(fragment_id))
+        if key not in self._ray_cache:
+            self._ray_cache[key] = build_ray_bundle(
+                self.rgbd_root,
+                scene,
+                f"cloud_bin_{fragment_id}",
+                self.ray_manifest,
+                self.ray_stride,
+                self.fsv_max_frames,
+                self.ray_search_fraction,
+                self.fsv_depth_scale,
+                self.ray_min_depth,
+                self.ray_max_depth,
+                "cpu",
+            )
+        return self._ray_cache[key].to(device)
+
+    def get_pair(self, index):
 
         gt_trans = integrate_trans(self.infos['rot'][index], self.infos['trans'][index])
         scene = self.infos['src'][index].split('/')[1]
@@ -289,32 +321,17 @@ class ThreeDLoMatchLoader(data.Dataset):
             if tgt_keypts.size(0) > self.num_node:
                 idx = torch.randperm(tgt_keypts.size(0), device=tgt_keypts.device)[:self.num_node]
                 tgt_keypts, tgt_features, tgt_overlap = tgt_keypts[idx], tgt_features[idx], tgt_overlap[idx]
-        target_free_space = load_target_free_space(
-            self.free_space_root,
-            self.rgbd_root,
-            scene,
-            tgt_id,
-            src_keypts.device,
-            self.fsv_voxel_size,
-            self.fsv_depth_scale,
-            self.fsv_trunc_margin,
-            self.fsv_stride,
-            self.fsv_max_frames,
-            require=self.use_rgbd_fsv,
-        )
-
-        return (
-            src_keypts[None],
-            tgt_keypts[None],
-            src_features[None],
-            tgt_features[None],
-            gt_trans[None],
-            src_keypts[None],
-            tgt_keypts[None],
-            src_overlap[None],
-            tgt_overlap[None],
-            target_free_space,
-            overlap_source,
+        return RegistrationPair(
+            src_keypoints=src_keypts[None],
+            tgt_keypoints=tgt_keypts[None],
+            src_features=src_features[None],
+            tgt_features=tgt_features[None],
+            src_overlap=src_overlap[None],
+            tgt_overlap=tgt_overlap[None],
+            src_ray_bundle=self._ray_bundle(scene, src_id, src_keypts.device),
+            tgt_ray_bundle=self._ray_bundle(scene, tgt_id, src_keypts.device),
+            gt_transform=gt_trans[None],
+            pair_id=f"{scene}@cloud_bin_{src_id}_cloud_bin_{tgt_id}",
         )
 
 

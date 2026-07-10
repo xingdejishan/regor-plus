@@ -176,7 +176,7 @@ def load_target_free_space(free_space_root, rgbd_root, scene, target_id, device,
     return None
 
 
-def compute_rgbd_fsv(src_points, trans, target_free_space):
+def compute_binary_voxel_fsv(src_points, trans, target_free_space):
     if target_free_space is None:
         raise FileNotFoundError("Missing target free-space volume for use_rgbd_fsv=True.")
     warped_src = torch.einsum('bnm,bmk->bnk', trans[:, :3, :3], src_points.permute(0, 2, 1)) + trans[:, :3, 3:4]

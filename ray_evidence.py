@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -6,37 +7,92 @@ import numpy as np
 import open3d as o3d
 import torch
 
-from utils.SE3 import transform
+
+SEARCH_SPLIT = 1
+VALIDATION_SPLIT = 0
 
 
-@dataclass
+@dataclass(frozen=True)
 class RayBundle:
     frame_ids: torch.Tensor
     origins: torch.Tensor
     directions: torch.Tensor
-    observed_depth: torch.Tensor
+    observed_depths: torch.Tensor
+    valid_depth: torch.Tensor
     pixels: torch.Tensor
     camera_poses: torch.Tensor
-    confidence: torch.Tensor
-    split: torch.Tensor
     intrinsics: torch.Tensor
+    confidences: torch.Tensor
+    split_ids: torch.Tensor
+    depth_maps: torch.Tensor
+    fragment_pose: torch.Tensor
+    frame_numbers: torch.Tensor | None = None
+    frame_camera_poses: torch.Tensor | None = None
+    frame_split_ids: torch.Tensor | None = None
+
+    @property
+    def observed_depth(self):
+        return self.observed_depths
+
+    @property
+    def confidence(self):
+        return self.confidences
+
+    @property
+    def split(self):
+        return self.split_ids
 
     def to(self, device):
-        return RayBundle(
-            self.frame_ids.to(device), self.origins.to(device), self.directions.to(device),
-            self.observed_depth.to(device), self.pixels.to(device), self.camera_poses.to(device),
-            self.confidence.to(device), self.split.to(device), self.intrinsics.to(device),
-        )
+        values = [
+            self.frame_ids, self.origins, self.directions, self.observed_depths,
+            self.valid_depth, self.pixels, self.camera_poses, self.intrinsics,
+            self.confidences, self.split_ids, self.depth_maps, self.fragment_pose,
+            self.frame_numbers, self.frame_camera_poses, self.frame_split_ids,
+        ]
+        return RayBundle(*(value.to(device) if value is not None else None for value in values))
+
+    def frame_indices(self, split_id=None):
+        poses = self.frame_camera_poses if self.frame_camera_poses is not None else self.camera_poses
+        splits = self.frame_split_ids if self.frame_split_ids is not None else self.split_ids
+        if split_id is None:
+            return torch.arange(poses.shape[0], device=poses.device)
+        return torch.where(splits == int(split_id))[0]
+
+    @property
+    def projection_poses(self):
+        return self.frame_camera_poses if self.frame_camera_poses is not None else self.camera_poses
+
+
+@dataclass(frozen=True)
+class RayEvaluation:
+    free_violation: float
+    surface_support: float
+    valid_observation_count: int
+    per_frame_scores: torch.Tensor
+    per_ray_residuals: torch.Tensor
+    ray_ids: torch.Tensor
+    point_ids: torch.Tensor
+    frame_indices: torch.Tensor
+    bidirectional_consistency: float = 0.0
+
+    @property
+    def valid_observation_ratio(self):
+        if self.per_frame_scores.numel() == 0:
+            return 0.0
+        possible = int(self.per_frame_scores.shape[0] * max(1, self.point_ids.unique().numel()))
+        return float(self.valid_observation_count / max(1, possible))
 
 
 def _load_manifest(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _fragment_entry(manifest, scene, fragment_id):
+    normalized = str(fragment_id).replace("cloud_bin_", "")
     for entry in manifest:
-        if entry["scene"] == scene and entry["fragment_id"] == fragment_id:
+        candidate = str(entry["fragment_id"])
+        if entry["scene"] == scene and candidate in {str(fragment_id), normalized, f"cloud_bin_{normalized}"}:
             return entry
     raise KeyError(f"Missing {scene}/{fragment_id} in fragment manifest.")
 
@@ -46,6 +102,19 @@ def _read_pose(path):
     if pose.shape != (4, 4):
         raise ValueError(f"Expected 4x4 pose at {path}, got {pose.shape}.")
     return pose
+
+
+def _stable_search_split(frame_id, search_fraction):
+    digest = hashlib.sha256(str(int(frame_id)).encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], byteorder="big") / float(2**64)
+    return SEARCH_SPLIT if value < float(search_fraction) else VALIDATION_SPLIT
+
+
+def _load_depth(path, depth_scale):
+    depth = np.asarray(o3d.io.read_image(path)).astype(np.float32)
+    if depth.ndim == 3:
+        depth = depth[..., 0]
+    return depth / float(depth_scale)
 
 
 def build_ray_bundle(
@@ -61,116 +130,255 @@ def build_ray_bundle(
     max_depth=8.0,
     device="cpu",
 ):
-    manifest = _load_manifest(manifest_path)
-    entry = _fragment_entry(manifest, scene, fragment_id)
-    sequence = entry["sequence"]
-    start = int(entry["frame_start"])
-    end = int(entry["frame_end"])
-    frame_ids = list(range(start, end + 1))
+    if not manifest_path:
+        raise ValueError("RayBundle requires a fragment manifest with sequence and frame ranges.")
+    entry = _fragment_entry(_load_manifest(manifest_path), scene, fragment_id)
+    frame_ids = list(range(int(entry["frame_start"]), int(entry["frame_end"]) + 1))
     if max_frames > 0:
-        frame_ids = frame_ids[:max_frames]
+        frame_ids = frame_ids[:int(max_frames)]
+    if not frame_ids:
+        raise ValueError(f"No frames selected for {scene}/{fragment_id}.")
     intrinsics_path = os.path.join(rgbd_root, scene, "camera-intrinsics.txt")
-    intrinsics = np.loadtxt(intrinsics_path).astype(np.float32)
+    intrinsics = np.loadtxt(intrinsics_path).astype(np.float32)[:3, :3]
     fx, fy, cx, cy = intrinsics[0, 0], intrinsics[1, 1], intrinsics[0, 2], intrinsics[1, 2]
-    raw_scene = os.path.join(rgbd_root, scene)
-    ray_frames, ray_origins, ray_directions, ray_depths, ray_pixels, ray_poses, ray_conf, ray_split = [], [], [], [], [], [], [], []
+    frame_poses, depth_maps, sampled_frame_ids, origins, directions, observed, valid, pixels, camera_poses, confidences, split_ids = [], [], [], [], [], [], [], [], [], [], []
+    sequence = entry["sequence"]
     for frame_id in frame_ids:
-        frame = f"frame-{frame_id:06d}"
-        depth_path = os.path.join(raw_scene, sequence, f"{frame}.depth.png")
-        pose_path = os.path.join(raw_scene, sequence, f"{frame}.pose.txt")
+        stem = f"frame-{frame_id:06d}"
+        root = os.path.join(rgbd_root, scene, sequence)
+        depth_path = os.path.join(root, f"{stem}.depth.png")
+        pose_path = os.path.join(root, f"{stem}.pose.txt")
         if not os.path.exists(depth_path) or not os.path.exists(pose_path):
-            raise FileNotFoundError(f"Missing RGB-D frame or pose for {scene}/{sequence}/{frame}.")
-        depth = np.asarray(o3d.io.read_image(depth_path)).astype(np.float32) / depth_scale
+            raise FileNotFoundError(f"Missing RGB-D frame or pose for {scene}/{sequence}/{stem}.")
+        depth = _load_depth(depth_path, depth_scale)
         pose = _read_pose(pose_path)
-        ys, xs = np.mgrid[0:depth.shape[0]:stride, 0:depth.shape[1]:stride]
+        frame_poses.append(pose)
+        depth_maps.append(depth)
+        ys, xs = np.mgrid[0:depth.shape[0]:max(1, int(stride)), 0:depth.shape[1]:max(1, int(stride))]
         z = depth[ys, xs].reshape(-1)
-        valid = (z >= min_depth) & (z <= max_depth)
-        if not np.any(valid):
-            continue
-        xs_flat = xs.reshape(-1)[valid].astype(np.float32)
-        ys_flat = ys.reshape(-1)[valid].astype(np.float32)
-        z = z[valid].astype(np.float32)
-        cam_dirs = np.stack([(xs_flat - cx) / fx, (ys_flat - cy) / fy, np.ones_like(z)], axis=1)
+        sample_valid = np.isfinite(z) & (z >= min_depth) & (z <= max_depth)
+        xs = xs.reshape(-1).astype(np.float32)
+        ys = ys.reshape(-1).astype(np.float32)
+        z = z.astype(np.float32)
+        cam_dirs = np.stack([(xs - cx) / fx, (ys - cy) / fy, np.ones_like(z)], axis=1)
         cam_dirs /= np.linalg.norm(cam_dirs, axis=1, keepdims=True) + 1e-8
-        world_dirs = cam_dirs @ pose[:3, :3].T
-        origins = np.repeat(pose[:3, 3][None], z.shape[0], axis=0)
-        poses = np.repeat(pose[None], z.shape[0], axis=0)
-        split_value = int((frame_id % 100) < round(search_fraction * 100.0))
-        ray_frames.append(np.full(z.shape[0], frame_id, dtype=np.int64))
-        ray_origins.append(origins.astype(np.float32))
-        ray_directions.append(world_dirs.astype(np.float32))
-        ray_depths.append(z)
-        ray_pixels.append(np.stack([xs_flat, ys_flat], axis=1))
-        ray_poses.append(poses)
-        ray_conf.append(np.ones(z.shape[0], dtype=np.float32))
-        ray_split.append(np.full(z.shape[0], split_value, dtype=np.int64))
-    if not ray_frames:
-        raise ValueError(f"No valid rays for {scene}/{fragment_id}.")
-    make = lambda values, dtype=None: torch.from_numpy(np.concatenate(values, axis=0)).to(device=device, dtype=dtype)
+        directions.append((cam_dirs @ pose[:3, :3].T).astype(np.float32))
+        origins.append(np.repeat(pose[:3, 3][None], z.shape[0], axis=0).astype(np.float32))
+        observed.append(z)
+        valid.append(sample_valid)
+        pixels.append(np.stack([xs, ys], axis=1))
+        sampled_frame_ids.append(np.full(z.shape[0], frame_id, dtype=np.int64))
+        camera_poses.append(np.repeat(pose[None], z.shape[0], axis=0))
+        confidences.append(sample_valid.astype(np.float32))
+        split_ids.append(np.full(z.shape[0], _stable_search_split(frame_id, search_fraction), dtype=np.int64))
+    shapes = {depth.shape for depth in depth_maps}
+    if len(shapes) != 1:
+        raise ValueError(f"Depth-map shapes differ inside {scene}/{fragment_id}; RayBundle requires a common camera resolution.")
+    frame_count = len(frame_ids)
+    height, width = depth_maps[0].shape
+    frame_ids_tensor = torch.from_numpy(np.concatenate(sampled_frame_ids)).to(device=device, dtype=torch.long)
+    frame_pose_tensor = torch.from_numpy(np.stack(frame_poses)).to(device=device, dtype=torch.float32)
+    split_per_frame = torch.tensor([_stable_search_split(frame_id, search_fraction) for frame_id in frame_ids], dtype=torch.long, device=device)
+    fragment_pose = entry.get("fragment_pose")
+    if isinstance(fragment_pose, str):
+        fragment_pose = np.asarray(json.loads(fragment_pose), dtype=np.float32)
+    if fragment_pose is None:
+        fragment_pose = np.eye(4, dtype=np.float32)
+    fragment_pose = np.asarray(fragment_pose, dtype=np.float32)
+    if fragment_pose.shape != (4, 4):
+        raise ValueError(f"Invalid fragment pose for {scene}/{fragment_id}.")
     return RayBundle(
-        frame_ids=make(ray_frames, torch.long),
-        origins=make(ray_origins, torch.float32),
-        directions=make(ray_directions, torch.float32),
-        observed_depth=make(ray_depths, torch.float32),
-        pixels=make(ray_pixels, torch.float32),
-        camera_poses=make(ray_poses, torch.float32),
-        confidence=make(ray_conf, torch.float32),
-        split=make(ray_split, torch.long),
+        frame_ids=frame_ids_tensor,
+        origins=torch.from_numpy(np.concatenate(origins, axis=0)).to(device=device, dtype=torch.float32),
+        directions=torch.from_numpy(np.concatenate(directions, axis=0)).to(device=device, dtype=torch.float32),
+        observed_depths=torch.from_numpy(np.concatenate(observed, axis=0)).to(device=device, dtype=torch.float32),
+        valid_depth=torch.from_numpy(np.concatenate(valid, axis=0)).to(device=device, dtype=torch.bool),
+        pixels=torch.from_numpy(np.concatenate(pixels, axis=0)).to(device=device, dtype=torch.float32),
+        camera_poses=torch.from_numpy(np.concatenate(camera_poses, axis=0)).to(device=device, dtype=torch.float32),
         intrinsics=torch.from_numpy(intrinsics).to(device=device, dtype=torch.float32),
+        confidences=torch.from_numpy(np.concatenate(confidences, axis=0)).to(device=device, dtype=torch.float32),
+        split_ids=split_per_frame,
+        depth_maps=torch.from_numpy(np.stack(depth_maps).reshape(frame_count, height, width)).to(device=device, dtype=torch.float32),
+        fragment_pose=torch.from_numpy(fragment_pose).to(device=device, dtype=torch.float32),
+        frame_numbers=torch.tensor(frame_ids, dtype=torch.long, device=device),
+        frame_camera_poses=frame_pose_tensor,
+        frame_split_ids=split_per_frame,
     )
 
 
-def ray_energy(points, pose, bundle, surface_mu=0.05, surface_sigma=0.03, ray_ids=None):
-    if points.ndim == 3:
-        points = points[0]
-    if pose.ndim == 2:
-        pose = pose[None]
-    if ray_ids is None:
-        ray_ids = torch.arange(bundle.frame_ids.shape[0], device=points.device)
-    if ray_ids.numel() == 0:
-        return 0.0, 0.0, torch.zeros(0, device=points.device)
-    points_world = transform(points[None], pose)[0]
-    selected_frames = torch.unique(bundle.frame_ids[ray_ids])
-    frame_violations = []
-    frame_support = []
-    for frame_id in selected_frames.tolist():
-        frame_mask = bundle.frame_ids[ray_ids] == frame_id
-        ids = ray_ids[frame_mask]
-        ray_origin = bundle.origins[ids[0]]
-        ray_direction = bundle.directions[ids]
-        ray_depth = bundle.observed_depth[ids]
-        point_vectors = points_world - ray_origin.view(1, 3)
-        point_depth = torch.linalg.norm(point_vectors, dim=1)
-        point_direction = point_vectors / (point_depth[:, None] + 1e-8)
-        cosine = ray_direction @ point_direction.transpose(0, 1)
-        best_cosine, best_point = cosine.max(dim=1)
-        predicted_depth = point_depth[best_point]
-        valid = best_cosine > 0.999
-        violation = torch.relu(ray_depth - surface_mu - predicted_depth) * valid.float()
-        support = torch.exp(-torch.abs(predicted_depth - ray_depth) / max(surface_sigma, 1e-6)) * valid.float()
-        frame_violations.append((violation * bundle.confidence[ids]).sum() / (bundle.confidence[ids].sum() + 1e-6))
-        frame_support.append((support * bundle.confidence[ids]).sum() / (bundle.confidence[ids].sum() + 1e-6))
-    violations = torch.stack(frame_violations)
-    supports = torch.stack(frame_support)
-    return float(violations.median().item()), float(supports.median().item()), violations
+def _as_points(points):
+    return points[0] if points.ndim == 3 else points
 
 
-def bidirectional_ray_energy(src_points, tgt_points, pose, source_rays, target_rays, surface_mu=0.05, surface_sigma=0.03, split=None):
-    source_ids = None if split is None else torch.where(source_rays.split == split)[0]
-    target_ids = None if split is None else torch.where(target_rays.split == split)[0]
-    target_free, target_surface, target_violations = ray_energy(src_points, pose, target_rays, surface_mu, surface_sigma, target_ids)
-    inverse_pose = torch.linalg.inv(pose)
-    source_free, source_surface, source_violations = ray_energy(tgt_points, inverse_pose, source_rays, surface_mu, surface_sigma, source_ids)
+def _as_pose(pose):
+    return pose[0] if pose.ndim == 3 else pose
+
+
+def transform_points(points, pose):
+    return points @ pose[:3, :3].transpose(0, 1) + pose[:3, 3]
+
+
+def evaluate_projected_points(points_world, bundle, surface_mu=0.05, surface_sigma=0.03, split_id=None):
+    points_world = _as_points(points_world)
+    frame_indices = bundle.frame_indices(split_id)
+    device = points_world.device
+    empty = torch.empty(0, device=device, dtype=points_world.dtype)
+    if frame_indices.numel() == 0 or points_world.numel() == 0:
+        return RayEvaluation(0.0, 0.0, 0, torch.empty((0, 4), device=device), empty, empty.long(), empty.long(), empty.long())
+    fx, fy, cx, cy = bundle.intrinsics[0, 0], bundle.intrinsics[1, 1], bundle.intrinsics[0, 2], bundle.intrinsics[1, 2]
+    height, width = bundle.depth_maps.shape[-2:]
+    per_frame, residuals, ray_ids, point_ids, observation_frames = [], [], [], [], []
+    for frame_index in frame_indices.tolist():
+        world_to_camera = torch.linalg.inv(bundle.projection_poses[frame_index])
+        points_camera = transform_points(points_world, world_to_camera)
+        z = points_camera[:, 2]
+        projected_u = torch.round(fx * points_camera[:, 0] / torch.clamp_min(z, 1e-8) + cx).long()
+        projected_v = torch.round(fy * points_camera[:, 1] / torch.clamp_min(z, 1e-8) + cy).long()
+        in_view = (z > 0) & (projected_u >= 0) & (projected_u < width) & (projected_v >= 0) & (projected_v < height)
+        if not in_view.any():
+            per_frame.append(torch.tensor([float(frame_index), 0.0, 0.0, 0.0], device=device))
+            continue
+        point_index = torch.where(in_view)[0]
+        observed = bundle.depth_maps[frame_index, projected_v[point_index], projected_u[point_index]]
+        valid = torch.isfinite(observed) & (observed > 0)
+        point_index, observed = point_index[valid], observed[valid]
+        if point_index.numel() == 0:
+            per_frame.append(torch.tensor([float(frame_index), 0.0, 0.0, 0.0], device=device))
+            continue
+        predicted_depth = z[point_index]
+        informative = predicted_depth <= observed + surface_mu
+        point_index, observed, predicted_depth = point_index[informative], observed[informative], predicted_depth[informative]
+        if point_index.numel() == 0:
+            per_frame.append(torch.tensor([float(frame_index), 0.0, 0.0, 0.0], device=device))
+            continue
+        violation = torch.relu(observed - surface_mu - predicted_depth)
+        support = torch.exp(-torch.abs(predicted_depth - observed) / max(float(surface_sigma), 1e-8))
+        per_frame.append(torch.stack([
+            torch.tensor(float(frame_index), device=device),
+            violation.mean(),
+            support.mean(),
+            torch.tensor(float(point_index.numel()), device=device),
+        ]))
+        residuals.append(violation)
+        ray_ids.append(frame_index * height * width + projected_v[point_index] * width + projected_u[point_index])
+        point_ids.append(point_index)
+        observation_frames.append(torch.full_like(point_index, frame_index))
+    scores = torch.stack(per_frame) if per_frame else torch.empty((0, 4), device=device)
+    count = int(scores[:, 3].sum().item()) if scores.numel() else 0
+    observed_frames = scores[:, 3] > 0 if scores.numel() else torch.zeros(0, dtype=torch.bool, device=device)
+    free = float(scores[observed_frames, 1].median().item()) if observed_frames.any() else 0.0
+    surface = float(scores[observed_frames, 2].median().item()) if observed_frames.any() else 0.0
+    return RayEvaluation(
+        free_violation=free,
+        surface_support=surface,
+        valid_observation_count=count,
+        per_frame_scores=scores,
+        per_ray_residuals=torch.cat(residuals) if residuals else empty,
+        ray_ids=torch.cat(ray_ids) if ray_ids else empty.long(),
+        point_ids=torch.cat(point_ids) if point_ids else empty.long(),
+        frame_indices=torch.cat(observation_frames) if observation_frames else empty.long(),
+    )
+
+
+def bidirectional_ray_evaluation(src_points, tgt_points, pose, source_rays, target_rays, surface_mu=0.05, surface_sigma=0.03, split_id=None):
+    pose = _as_pose(pose)
+    src_in_target = transform_points(_as_points(src_points), pose)
+    tgt_in_source = transform_points(_as_points(tgt_points), torch.linalg.inv(pose))
+    src_world = transform_points(src_in_target, target_rays.fragment_pose)
+    tgt_world = transform_points(tgt_in_source, source_rays.fragment_pose)
+    target_eval = evaluate_projected_points(src_world, target_rays, surface_mu, surface_sigma, split_id)
+    source_eval = evaluate_projected_points(tgt_world, source_rays, surface_mu, surface_sigma, split_id)
+    total = target_eval.valid_observation_count + source_eval.valid_observation_count
+    if total == 0:
+        free, support = 0.0, 0.0
+    else:
+        free = (target_eval.free_violation * target_eval.valid_observation_count + source_eval.free_violation * source_eval.valid_observation_count) / total
+        support = (target_eval.surface_support * target_eval.valid_observation_count + source_eval.surface_support * source_eval.valid_observation_count) / total
+    residuals = torch.cat([target_eval.per_ray_residuals, source_eval.per_ray_residuals])
+    ray_ids = torch.cat([target_eval.ray_ids, source_eval.ray_ids])
+    point_ids = torch.cat([target_eval.point_ids, source_eval.point_ids])
+    frame_indices = torch.cat([target_eval.frame_indices, source_eval.frame_indices])
+    consistency = 1.0 - abs(target_eval.free_violation - source_eval.free_violation) / (target_eval.free_violation + source_eval.free_violation + 1e-8)
     return {
-        "free": 0.5 * (target_free + source_free),
-        "surface": 0.5 * (target_surface + source_surface),
-        "target_free": target_free,
-        "source_free": source_free,
-        "target_violations": target_violations,
-        "source_violations": source_violations,
+        "free_violation": float(free),
+        "surface_support": float(support),
+        "valid_observation_count": int(total),
+        "target": target_eval,
+        "source": source_eval,
+        "per_ray_residuals": residuals,
+        "ray_ids": ray_ids,
+        "point_ids": point_ids,
+        "frame_indices": frame_indices,
+        "bidirectional_consistency": float(consistency),
     }
 
 
-def ray_signature(energy, threshold=0.01):
-    values = torch.cat([energy["target_violations"], energy["source_violations"]], dim=0)
-    return (values > threshold).to(torch.float32)
+def _transform_pose_batch(points, poses):
+    if points.ndim == 2:
+        return torch.einsum("nj,kij->kni", points, poses[:, :3, :3].transpose(1, 2)) + poses[:, None, :3, 3]
+    return torch.einsum("knj,kij->kni", points, poses[:, :3, :3].transpose(1, 2)) + poses[:, None, :3, 3]
+
+
+def _evaluate_direction_batch(points, poses, fragment_pose, bundle, surface_mu, surface_sigma, split_id):
+    poses = poses if poses.ndim == 3 else poses[None]
+    if points.ndim == 2:
+        points = points[None].expand(poses.shape[0], -1, -1)
+    point_count = points.shape[1]
+    world = _transform_pose_batch(points, poses)
+    world = _transform_pose_batch(world.reshape(-1, 3), fragment_pose[None]).reshape(poses.shape[0], point_count, 3)
+    frame_indices = bundle.frame_indices(split_id)
+    count = torch.zeros(poses.shape[0], device=poses.device, dtype=poses.dtype)
+    free_scores, surface_scores, frame_counts = [], [], []
+    fx, fy, cx, cy = bundle.intrinsics[0, 0], bundle.intrinsics[1, 1], bundle.intrinsics[0, 2], bundle.intrinsics[1, 2]
+    height, width = bundle.depth_maps.shape[-2:]
+    for frame_index in frame_indices.tolist():
+        world_to_camera = torch.linalg.inv(bundle.projection_poses[frame_index])
+        camera = _transform_pose_batch(world.reshape(-1, 3), world_to_camera[None]).reshape_as(world)
+        z = camera[..., 2]
+        u = torch.round(fx * camera[..., 0] / torch.clamp_min(z, 1e-8) + cx).long()
+        v = torch.round(fy * camera[..., 1] / torch.clamp_min(z, 1e-8) + cy).long()
+        in_view = (z > 0) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        u, v = u.clamp(0, width - 1), v.clamp(0, height - 1)
+        observed = bundle.depth_maps[frame_index].reshape(-1)[(v * width + u).reshape(-1)].reshape_as(z)
+        informative = in_view & torch.isfinite(observed) & (observed > 0) & (z <= observed + surface_mu)
+        denominator = informative.sum(dim=1).to(poses.dtype)
+        violation = torch.relu(observed - surface_mu - z) * informative
+        support = torch.exp(-torch.abs(z - observed) / max(float(surface_sigma), 1e-8)) * informative
+        free_scores.append(violation.sum(dim=1) / torch.clamp_min(denominator, 1.0))
+        surface_scores.append(support.sum(dim=1) / torch.clamp_min(denominator, 1.0))
+        frame_counts.append(denominator)
+        count += denominator
+    if not free_scores:
+        zeros = torch.zeros(poses.shape[0], device=poses.device, dtype=poses.dtype)
+        return zeros, zeros, zeros
+    free_stack, surface_stack = torch.stack(free_scores, dim=1), torch.stack(surface_scores, dim=1)
+    per_frame_valid = torch.stack(frame_counts, dim=1) > 0
+    free = torch.nanmedian(torch.where(per_frame_valid, free_stack, torch.full_like(free_stack, float("nan"))), dim=1).values.nan_to_num(0.0)
+    surface = torch.nanmedian(torch.where(per_frame_valid, surface_stack, torch.full_like(surface_stack, float("nan"))), dim=1).values.nan_to_num(0.0)
+    return free, surface, count
+
+
+def evaluate_pose_batch(poses, src_points, tgt_points, source_rays, target_rays, surface_mu=0.05, surface_sigma=0.03, split_id=None):
+    poses = poses if poses.ndim == 3 else poses[None]
+    src_in_target = _transform_pose_batch(_as_points(src_points), poses)
+    inverse = torch.linalg.inv(poses)
+    tgt_in_source = _transform_pose_batch(_as_points(tgt_points), inverse)
+    target_free, target_surface, target_count = _evaluate_direction_batch(
+        src_in_target, torch.eye(4, device=poses.device, dtype=poses.dtype)[None].expand(poses.shape[0], -1, -1), target_rays.fragment_pose, target_rays, surface_mu, surface_sigma, split_id,
+    )
+    source_free, source_surface, source_count = _evaluate_direction_batch(
+        tgt_in_source, torch.eye(4, device=poses.device, dtype=poses.dtype)[None].expand(poses.shape[0], -1, -1), source_rays.fragment_pose, source_rays, surface_mu, surface_sigma, split_id,
+    )
+    count = target_count + source_count
+    free = (target_free * target_count + source_free * source_count) / torch.clamp_min(count, 1.0)
+    surface = (target_surface * target_count + source_surface * source_count) / torch.clamp_min(count, 1.0)
+    return {"free_violation": free, "surface_support": surface, "valid_observation_count": count}
+
+
+def ray_signature(evaluation, threshold=0.01, bins=32):
+    residuals = evaluation["per_ray_residuals"] if isinstance(evaluation, dict) else evaluation.per_ray_residuals
+    if residuals.numel() == 0:
+        return torch.zeros(bins, dtype=torch.float32, device=residuals.device)
+    values = residuals.detach().float()
+    quantiles = torch.quantile(values, torch.linspace(0, 1, bins + 1, device=values.device))
+    return (quantiles[1:] > float(threshold)).float()

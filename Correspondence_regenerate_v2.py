@@ -245,17 +245,10 @@ class Regenerator():
             tgt_key2 = open3d.geometry.PointCloud()
             tgt_key2.points = open3d.utility.Vector3dVector(tgt_point_corr2.view(-1, 3).cpu().numpy())
 
-            visualization.draw_registration_corr2(src, tgt, src_key0, tgt_key0,
-                                                  np.linalg.inv(self.gt_trans[0].cpu().numpy()))
-            print("重新匹配")
-            visualization.draw_registration_corr2(src, tgt, src_key, tgt_key,
-                                                  np.linalg.inv(self.gt_trans[0].cpu().numpy()))
-            print("局部过滤")
-            visualization.draw_registration_corr2(src, tgt, src_key1, tgt_key1,
-                                                  np.linalg.inv(self.gt_trans[0].cpu().numpy()))
-            print("全局过滤")
-            visualization.draw_registration_corr2(src, tgt, src_key2, tgt_key2,
-                                                  np.linalg.inv(self.gt_trans[0].cpu().numpy()))
+            visualization.draw_registration_corr2(src, tgt, src_key0, tgt_key0, np.eye(4))
+            visualization.draw_registration_corr2(src, tgt, src_key, tgt_key, np.eye(4))
+            visualization.draw_registration_corr2(src, tgt, src_key1, tgt_key1, np.eye(4))
+            visualization.draw_registration_corr2(src, tgt, src_key2, tgt_key2, np.eye(4))
 
         return src_point_corr2, tgt_point_corr2
 
@@ -333,7 +326,6 @@ class Regenerator():
         # src.points = open3d.utility.Vector3dVector(src_knn_corr_s.view(-1, 3).cpu().numpy())
         # tgt = open3d.geometry.PointCloud()
         # tgt.points = open3d.utility.Vector3dVector(tgt_knn_corr_s.view(-1, 3).cpu().numpy())
-        # visualization.draw_registration_corr2(src, tgt, src, tgt, np.linalg.inv(self.gt_trans[0].cpu().numpy()))
 
         distance_src = torch.norm((src_knn_corr_s[:, :, None, :] - src_knn_corr_s[:, None, :, :]), dim=-1)
         distance_tgt = torch.norm((tgt_knn_corr_s[:, :, None, :] - tgt_knn_corr_s[:, None, :, :]), dim=-1)
@@ -545,7 +537,7 @@ class Regenerator():
             final_tran = rigid_transform_3d(src_corr, tgt_corr, self.last_match_weights[None])
         return src_corr, tgt_corr, final_tran
 
-    def guided_global_matching(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, guide, sampling_num):
+    def regenerate_seed_group(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, guide):
         return self.paired_local_matching(
             src_key_corr,
             tgt_key_corr,
@@ -675,7 +667,7 @@ class Regenerator():
 
         return src_keypts_best_corr, tgt_keypts_best_corr
 
-    def regenerate(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, gt_trans, knn_num=100, sampling_num=100, knn_radius=0.8, use_sampling=False, guide=None, mode="local"):
+    def regenerate(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, knn_num=100, sampling_num=100, knn_radius=0.8, use_sampling=False, guide=None, mode="local"):
         """
         Input:
             - src_key_corr: [bs, num_key_corr, 3]
@@ -689,12 +681,11 @@ class Regenerator():
             - src_corr_final:  [bs, num_corr, 3], the source points in the matched correspondences
             - src_corr_final:  [bs, num_corr, 3], the target points in the matched correspondences
         """
-        self.gt_trans = gt_trans
         self.use_sampling = use_sampling
         self.last_match_weights = None
         self.last_r2_candidates = []
-        if mode in ("guided_global", "paired_local"):
-            return self.guided_global_matching(
+        if mode == "paired_local":
+            return self.regenerate_seed_group(
                 src_key_corr,
                 tgt_key_corr,
                 src_point,
@@ -702,8 +693,9 @@ class Regenerator():
                 src_feature,
                 tgt_feature,
                 guide,
-                sampling_num
             )
+        if mode != "local":
+            raise ValueError("mode must be local or paired_local; guided_global is removed because it bypassed seeds.")
         #################################
         # knn & regenerate correspondences
         #################################

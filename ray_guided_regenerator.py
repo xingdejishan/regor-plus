@@ -3,113 +3,200 @@ from dataclasses import dataclass, field
 import torch
 
 from common import rigid_transform_3d
-from utils.SE3 import transform
+from ray_evidence import transform_points
 
 
 @dataclass
 class PoseHypothesis:
-    pose: torch.Tensor
-    candidate_id: int
-    parent_candidate_id: int
+    hypothesis_id: int
+    parent_id: int
     round_id: int
-    seed_ids: list = field(default_factory=list)
-    correspondence_count: int = 0
+    pose_raw: torch.Tensor
+    pose_local_refined: torch.Tensor
+    src_corr: torch.Tensor
+    tgt_corr: torch.Tensor
+    correspondence_scores: torch.Tensor
+    seed_ids: torch.Tensor
+    generation_mode: str
     descriptor_score: float = 0.0
     predicted_escape_score: float = 0.0
-    actual_search_energy: float = 0.0
-    validation_energy: float = 0.0
+    history_penalty: float = 0.0
+    search_ray_score: float = float("inf")
+    validation_ray_score: float = float("inf")
     surface_support: float = 0.0
-    nearest_history_pose_distance: float = float("inf")
-    history_signature_similarity: float = 0.0
-    gt_re: float = float("nan")
-    gt_te: float = float("nan")
-    gt_success: int = -1
+    valid_observation_count: int = 0
+    valid_observation_ratio: float = 0.0
+    frame_coverage: float = 0.0
+    bidirectional_consistency: float = 0.0
+    nearest_history_distance: float = float("inf")
+    signature_similarity: float = 0.0
+    insufficient_evidence: bool = False
+    ray_signature: torch.Tensor | None = None
+
+    @property
+    def pose(self):
+        return self.pose_local_refined
+
+    @property
+    def candidate_id(self):
+        return self.hypothesis_id
+
+    @property
+    def parent_candidate_id(self):
+        return self.parent_id
+
+    @property
+    def correspondence_count(self):
+        return int(self.src_corr.shape[1])
+
+
+@dataclass(frozen=True)
+class DescriptorCache:
+    topk_indices: torch.Tensor
+    topk_scores: torch.Tensor
 
 
 class RayGuidedRegenerator:
-    def __init__(self, top_l=5, min_seed_count=3, local_regenerator=None):
-        self.top_l = int(top_l)
-        self.min_seed_count = int(min_seed_count)
+    def __init__(self, descriptor_topk, local_corr_max_points, local_knn_radius, local_mutual_k, escape_lambda, history_lambda, independent_explore_fraction, local_regenerator=None, seed_group_count=None):
+        self.descriptor_topk = int(descriptor_topk)
+        self.local_corr_max_points = int(local_corr_max_points)
+        self.local_knn_radius = float(local_knn_radius)
+        self.local_mutual_k = int(local_mutual_k)
+        self.escape_lambda = float(escape_lambda)
+        self.history_lambda = float(history_lambda)
+        self.independent_explore_fraction = float(independent_explore_fraction)
         self.local_regenerator = local_regenerator
+        self.seed_group_count = int(seed_group_count) if seed_group_count is not None else None
+        self.descriptor_cache = None
 
-    def _candidate_pairs(self, src_features, tgt_features, active_source_indices):
-        src_desc = src_features[0, active_source_indices]
-        tgt_desc = tgt_features[0]
-        distance = torch.sqrt(torch.clamp(2 - 2 * (src_desc @ tgt_desc.T), min=1e-6))
-        topk = distance.topk(min(self.top_l, tgt_desc.shape[0]), dim=1, largest=False).indices
-        pairs = []
-        for source_local in range(topk.shape[0]):
-            for target_index in topk[source_local].tolist():
-                pairs.append((int(active_source_indices[source_local]), int(target_index), float(distance[source_local, target_index])))
-        pairs.sort(key=lambda item: item[2])
-        return pairs
+    def prepare_descriptor_cache(self, src_features, tgt_features):
+        src = src_features[0] if src_features.ndim == 3 else src_features
+        tgt = tgt_features[0] if tgt_features.ndim == 3 else tgt_features
+        scores = src @ tgt.transpose(0, 1)
+        topk_scores, topk_indices = torch.topk(scores, k=min(self.descriptor_topk, tgt.shape[0]), dim=1)
+        self.descriptor_cache = DescriptorCache(topk_indices, topk_scores)
+        return self.descriptor_cache
 
-    def _make_pose(self, src_points, tgt_points, pair_group, current_pose):
-        if len(pair_group) < self.min_seed_count:
-            return None
-        src = src_points[torch.tensor([pair[0] for pair in pair_group], device=src_points.device)]
-        tgt = tgt_points[torch.tensor([pair[1] for pair in pair_group], device=tgt_points.device)]
-        pose = rigid_transform_3d(src[None], tgt[None])
-        if self.local_regenerator is not None:
-            seed_src = src[None]
-            seed_tgt = tgt[None]
-            refined_src, refined_tgt, refined_pose = self.local_regenerator.regenerate(
-                seed_src,
-                seed_tgt,
-                src_points[None],
-                tgt_points[None],
-                self._src_features,
-                self._tgt_features,
-                None,
-                knn_num=20,
-                sampling_num=len(pair_group),
-                guide={
-                    "local_radius": 0.3,
-                    "local_max_points": 64,
-                    "generalized_mutual_k": 3,
-                    "max_matches_per_seed": 20,
-                },
-                mode="paired_local",
+    def _candidate_pairs(self, src_features, tgt_features):
+        cache = self.descriptor_cache or self.prepare_descriptor_cache(src_features, tgt_features)
+        source = torch.arange(cache.topk_indices.shape[0], device=cache.topk_indices.device)[:, None].expand_as(cache.topk_indices)
+        return torch.stack([source.reshape(-1), cache.topk_indices.reshape(-1)], dim=1), cache.topk_scores.reshape(-1)
+
+    def _escape_score(self, current_pose, src_points, tgt_points, pairs, constraints):
+        if not constraints.constraints:
+            return torch.zeros(pairs.shape[0], dtype=src_points.dtype, device=src_points.device)
+        transformed = transform_points(src_points[pairs[:, 0]], current_pose)
+        translation = tgt_points[pairs[:, 1]] - transformed
+        delta = torch.cat([torch.zeros_like(translation), translation], dim=1)
+        residual = torch.relu(constraints.b[None] - delta @ constraints.G.transpose(0, 1))
+        return -(residual * constraints.weights[None]).mean(dim=1)
+
+    def _select_seed_groups(self, pairs, scores, src_points, tgt_points, group_count, explore_count, offset=0):
+        order = torch.argsort(scores, descending=True)
+        if order.numel():
+            order = torch.roll(order, shifts=-int(offset) % order.numel())
+        groups = []
+        used = set()
+        for rank, index in enumerate(order.tolist()):
+            pair = pairs[index]
+            key = (int(pair[0]), int(pair[1]))
+            if key in used:
+                continue
+            distance_src = torch.linalg.norm(src_points[pairs[:, 0]] - src_points[pair[0]], dim=1)
+            distance_tgt = torch.linalg.norm(tgt_points[pairs[:, 1]] - tgt_points[pair[1]], dim=1)
+            compatible = torch.where(torch.abs(distance_src - distance_tgt) <= self.local_knn_radius)[0]
+            if compatible.numel() < 3:
+                continue
+            compatible = compatible[torch.argsort(scores[compatible], descending=True)]
+            group = compatible[:min(6, compatible.numel())]
+            group_key = tuple((int(pairs[item, 0]), int(pairs[item, 1])) for item in group.tolist())
+            if group_key in used:
+                continue
+            used.add(group_key)
+            groups.append((group, "independent" if rank < explore_count else "ray_guided"))
+            if len(groups) >= group_count:
+                break
+        return groups
+
+    def _local_refine(self, seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features):
+        raw = rigid_transform_3d(seed_src, seed_tgt)
+        if self.local_regenerator is None:
+            return seed_src, seed_tgt, raw
+        guide = {
+            "local_radius": self.local_knn_radius,
+            "local_max_points": self.local_corr_max_points,
+            "generalized_mutual_k": self.local_mutual_k,
+            "max_matches_per_seed": self.local_corr_max_points,
+        }
+        try:
+            refined_src, refined_tgt, refined = self.local_regenerator.regenerate_seed_group(
+                seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features, guide,
             )
-            if refined_src.shape[1] >= 3:
-                pose = refined_pose
-        return pose
+        except (RuntimeError, ValueError):
+            return seed_src, seed_tgt, raw
+        if refined_src.shape[1] < 3:
+            return seed_src, seed_tgt, raw
+        return refined_src, refined_tgt, refined
 
-    def generate(self, current_pose, src_points, tgt_points, src_features, tgt_features, escape_constraints, history_memory, candidate_count, round_id=0):
-        self._src_features = src_features
-        self._tgt_features = tgt_features
-        src = src_points[0]
-        tgt = tgt_points[0]
-        source_count = min(src.shape[0], max(candidate_count * 4, 64))
-        source_indices = torch.arange(src.shape[0], device=src.device)
-        if source_indices.shape[0] > source_count:
-            source_indices = source_indices[:source_count]
-        pairs = self._candidate_pairs(src_features, tgt_features, source_indices)
-        if not pairs:
+    def _explicit_seed_groups(self, seed_src, seed_tgt, src_points, tgt_points):
+        if seed_src is None or seed_tgt is None:
             return []
-        preferred = escape_constraints.get("preferred_direction", torch.zeros(6, device=src.device))
+        source = seed_src[0] if seed_src.ndim == 3 else seed_src
+        target = seed_tgt[0] if seed_tgt.ndim == 3 else seed_tgt
+        source_ids = torch.cdist(source, src_points).argmin(dim=1)
+        target_ids = torch.cdist(target, tgt_points).argmin(dim=1)
+        pairs = torch.stack([source_ids, target_ids], dim=1)
+        groups = []
+        for start in range(0, pairs.shape[0], 6):
+            group = pairs[start:start + 6]
+            if group.shape[0] >= 3:
+                groups.append(group)
+        return groups
+
+    def generate_hypotheses(self, seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features, constraints, memory, candidate_count, round_id, parent_id):
+        if seed_src is not None and seed_tgt is not None:
+            if seed_src.shape[1] != seed_tgt.shape[1] or seed_src.shape[1] < 3:
+                raise ValueError("Explicit seed correspondences must be paired and contain at least three entries.")
+        src = src_points[0] if src_points.ndim == 3 else src_points
+        tgt = tgt_points[0] if tgt_points.ndim == 3 else tgt_points
+        pairs, descriptor_scores = self._candidate_pairs(src_features, tgt_features)
+        current_pose = getattr(constraints, "current_pose", None)
+        if current_pose is None:
+            raise ValueError("EscapeConstraints must carry current_pose for correspondence scoring.")
+        escape_scores = self._escape_score(current_pose, src, tgt, pairs, constraints)
+        approximate_pose = current_pose.clone().expand(pairs.shape[0], -1, -1).clone()
+        approximate_pose[:, :3, 3] += tgt[pairs[:, 1]] - transform_points(src[pairs[:, 0]], current_pose)
+        history_scores = memory.pose_penalty_batch(approximate_pose)
+        guided_scores = descriptor_scores + self.escape_lambda * escape_scores - self.history_lambda * history_scores
+        output_count = min(int(candidate_count), self.seed_group_count) if self.seed_group_count is not None else int(candidate_count)
+        explore_count = int(round(output_count * self.independent_explore_fraction))
+        guided_count = max(0, output_count - explore_count)
+        groups = self._select_seed_groups(pairs, guided_scores, src, tgt, guided_count, 0, round_id * max(1, candidate_count))
+        independent_groups = self._select_seed_groups(pairs, descriptor_scores, src, tgt, explore_count, explore_count, round_id * max(1, explore_count))
         hypotheses = []
-        used_groups = set()
-        for candidate_id in range(int(candidate_count)):
-            start = candidate_id % max(1, len(pairs) - self.min_seed_count + 1)
-            group = pairs[start:start + max(self.min_seed_count, 6)]
-            group_key = tuple((p[0], p[1]) for p in group)
-            if len(group) < self.min_seed_count or group_key in used_groups:
-                continue
-            used_groups.add(group_key)
-            pose = self._make_pose(src, tgt, group, current_pose)
-            if pose is None:
-                continue
-            delta_translation = pose[0, :3, 3] - current_pose[0, :3, 3]
-            predicted_escape = float(torch.dot(delta_translation, preferred[3:6]).item()) if preferred.numel() == 6 else 0.0
+        selected_groups = [(pairs[group], guided_scores[group], mode) for group, mode in groups]
+        selected_groups.extend((pairs[group], descriptor_scores[group], mode) for group, mode in independent_groups)
+        explicit_groups = self._explicit_seed_groups(seed_src, seed_tgt, src, tgt)
+        if explicit_groups:
+            selected_groups = [(group, torch.zeros(group.shape[0], device=src.device, dtype=src.dtype), "explicit_seed") for group in explicit_groups] + selected_groups
+        for group_pairs, group_scores, mode in selected_groups[:output_count]:
+            grouped_src = src[group_pairs[:, 0]][None]
+            grouped_tgt = tgt[group_pairs[:, 1]][None]
+            corr_src, corr_tgt, pose_refined = self._local_refine(grouped_src, grouped_tgt, src_points, tgt_points, src_features, tgt_features)
+            pose_raw = rigid_transform_3d(grouped_src, grouped_tgt)
             hypotheses.append(PoseHypothesis(
-                pose=pose,
-                candidate_id=candidate_id,
-                parent_candidate_id=-1,
-                round_id=round_id,
-                seed_ids=[p[0] for p in group],
-                correspondence_count=len(group),
-                descriptor_score=float(-sum(p[2] for p in group) / len(group)),
-                predicted_escape_score=predicted_escape,
+                hypothesis_id=-1,
+                parent_id=int(parent_id),
+                round_id=int(round_id),
+                pose_raw=pose_raw,
+                pose_local_refined=pose_refined,
+                src_corr=corr_src,
+                tgt_corr=corr_tgt,
+                correspondence_scores=group_scores,
+                seed_ids=group_pairs.detach().clone(),
+                generation_mode=mode,
+                descriptor_score=float(group_scores.mean().item()),
+                predicted_escape_score=float(self._escape_score(current_pose, src, tgt, group_pairs, constraints).mean().item()) if mode == "ray_guided" else 0.0,
+                history_penalty=float(memory.pose_penalty_batch(pose_raw).mean().item()),
             ))
         return hypotheses

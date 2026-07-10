@@ -80,7 +80,7 @@ def eval_3DMatch_scene(loader, matcher, regenerator, estimator, trans_evaluator,
             model_timer.tic()
             time1, time2, time3 = Timer(), Timer(), Timer()
             time1.tic()
-            pred_trans, src_keypts_corr_filtered, tgt_keypts_corr_filtered, src_keypts_corr, tgt_keypts_corr, src_desc_corr_final, tgt_desc_corr_final = matcher.estimator(src_keypts, tgt_keypts, src_features, tgt_features, gt_trans)
+            pred_trans, src_keypts_corr_filtered, tgt_keypts_corr_filtered, src_keypts_corr, tgt_keypts_corr, src_desc_corr_final, tgt_desc_corr_final = matcher.estimator(src_keypts, tgt_keypts, src_features, tgt_features)
             time1 = time1.toc()
             time2.tic()
             src_keypts_corr_final = src_keypts_corr_filtered
@@ -108,7 +108,6 @@ def eval_3DMatch_scene(loader, matcher, regenerator, estimator, trans_evaluator,
                 tgt_keypts,
                 src_features,
                 tgt_features,
-                gt_trans,
                 knn_num=100,
                 sampling_num=100
             )
@@ -120,7 +119,6 @@ def eval_3DMatch_scene(loader, matcher, regenerator, estimator, trans_evaluator,
                 tgt_keypts,
                 src_features,
                 tgt_features,
-                gt_trans,
                 knn_num=20,
                 sampling_num=500
             )

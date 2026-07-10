@@ -366,7 +366,7 @@ class Matcher_plus():
             src_corr.points = open3d.utility.Vector3dVector(src_keypts_corr.view(-1, 3).cpu().numpy())
             tgt_corr = open3d.geometry.PointCloud()
             tgt_corr.points = open3d.utility.Vector3dVector(tgt_keypts_corr.view(-1, 3).cpu().numpy())
-            visualization.draw_registration_corr2(src, tgt, src_corr, tgt_corr, np.linalg.inv(self.gt_trans[0].cpu().numpy()), 0.1)
+            visualization.draw_registration_corr2(src, tgt, src_corr, tgt_corr, np.eye(4), 0.1)
 
         return src_keypts, relax_match_points, relax_distance, src_keypts_corr, tgt_keypts_corr, src_desc_corr, tgt_desc_corr
 
@@ -490,7 +490,7 @@ class Matcher_plus():
 
         return potential_trans_by_IC, best_trans_by_IC
 
-    def estimator(self, src_keypts, tgt_keypts, src_features, tgt_features, gt_trans,  use_sampling=True):
+    def estimator(self, src_keypts, tgt_keypts, src_features, tgt_features, use_sampling=True):
         """
         Input:
             - src_keypts: [bs, num_corr, 3]
@@ -506,7 +506,6 @@ class Matcher_plus():
         #################################
         # generate coarse correspondences
         #################################
-        self.gt_trans = gt_trans
         src_keypts, relax_match_points, relax_distance, src_keypts_corr, tgt_keypts_corr, src_desc_corr, tgt_desc_corr = self.match_pair(src_keypts, tgt_keypts, src_features, tgt_features)
 
         #################################
