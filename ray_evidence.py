@@ -70,17 +70,59 @@ class RayEvaluation:
     valid_observation_count: int
     per_frame_scores: torch.Tensor
     per_ray_residuals: torch.Tensor
-    ray_ids: torch.Tensor
+    ray_keys: torch.Tensor
     point_ids: torch.Tensor
     frame_indices: torch.Tensor
+    evaluated_point_count: int
     bidirectional_consistency: float = 0.0
 
     @property
     def valid_observation_ratio(self):
-        if self.per_frame_scores.numel() == 0:
+        if self.per_frame_scores.numel() == 0 or self.evaluated_point_count == 0:
             return 0.0
-        possible = int(self.per_frame_scores.shape[0] * max(1, self.point_ids.unique().numel()))
+        possible = int(self.per_frame_scores.shape[0] * self.evaluated_point_count)
         return float(self.valid_observation_count / max(1, possible))
+
+
+@dataclass(frozen=True)
+class RayResidualSignature:
+    keys: torch.Tensor
+    residuals: torch.Tensor
+    observation_indices: torch.Tensor
+
+
+def _canonicalize_residuals(keys, residuals):
+    if residuals.numel() == 0:
+        return RayResidualSignature(keys.reshape(0, 3), residuals, torch.empty(0, device=residuals.device, dtype=torch.long))
+    unique_keys, inverse = torch.unique(keys, dim=0, sorted=True, return_inverse=True)
+    values = torch.zeros(unique_keys.shape[0], dtype=residuals.dtype, device=residuals.device)
+    values.scatter_reduce_(0, inverse, residuals, reduce="amax", include_self=True)
+    positions = torch.arange(residuals.numel(), device=residuals.device)
+    winner = residuals == values[inverse]
+    representative = torch.full((unique_keys.shape[0],), residuals.numel(), dtype=torch.long, device=residuals.device)
+    representative.scatter_reduce_(0, inverse[winner], positions[winner], reduce="amin", include_self=True)
+    return RayResidualSignature(unique_keys, values, representative)
+
+
+def align_ray_signatures(signatures):
+    signatures = [signature for signature in signatures if signature.keys.numel()]
+    if not signatures:
+        device = torch.device("cpu")
+        return torch.empty((0, 3), dtype=torch.long, device=device), torch.empty((0, 0), device=device)
+    all_keys = torch.cat([signature.keys for signature in signatures], dim=0)
+    unique_keys, inverse = torch.unique(all_keys, dim=0, sorted=True, return_inverse=True)
+    offsets, present, values = 0, [], []
+    for signature in signatures:
+        ids = inverse[offsets:offsets + signature.keys.shape[0]]
+        offsets += signature.keys.shape[0]
+        mask = torch.zeros(unique_keys.shape[0], dtype=torch.bool, device=unique_keys.device)
+        mask[ids] = True
+        vector = torch.zeros(unique_keys.shape[0], dtype=signature.residuals.dtype, device=unique_keys.device)
+        vector[ids] = signature.residuals
+        present.append(mask)
+        values.append(vector)
+    common = torch.stack(present).all(dim=0)
+    return unique_keys[common], torch.stack(values, dim=0)[:, common]
 
 
 def _load_manifest(path):
@@ -218,16 +260,16 @@ def transform_points(points, pose):
     return points @ pose[:3, :3].transpose(0, 1) + pose[:3, 3]
 
 
-def evaluate_projected_points(points_world, bundle, surface_mu=0.05, surface_sigma=0.03, split_id=None):
+def evaluate_projected_points(points_world, bundle, surface_mu=0.05, surface_sigma=0.03, split_id=None, direction_code=0):
     points_world = _as_points(points_world)
     frame_indices = bundle.frame_indices(split_id)
     device = points_world.device
     empty = torch.empty(0, device=device, dtype=points_world.dtype)
     if frame_indices.numel() == 0 or points_world.numel() == 0:
-        return RayEvaluation(0.0, 0.0, 0, torch.empty((0, 4), device=device), empty, empty.long(), empty.long(), empty.long())
+        return RayEvaluation(0.0, 0.0, 0, torch.empty((0, 4), device=device), empty, torch.empty((0, 3), dtype=torch.long, device=device), empty.long(), empty.long(), int(points_world.shape[0]))
     fx, fy, cx, cy = bundle.intrinsics[0, 0], bundle.intrinsics[1, 1], bundle.intrinsics[0, 2], bundle.intrinsics[1, 2]
     height, width = bundle.depth_maps.shape[-2:]
-    per_frame, residuals, ray_ids, point_ids, observation_frames = [], [], [], [], []
+    per_frame, residuals, ray_keys, point_ids, observation_frames = [], [], [], [], []
     for frame_index in frame_indices.tolist():
         world_to_camera = torch.linalg.inv(bundle.projection_poses[frame_index])
         points_camera = transform_points(points_world, world_to_camera)
@@ -260,7 +302,13 @@ def evaluate_projected_points(points_world, bundle, surface_mu=0.05, surface_sig
             torch.tensor(float(point_index.numel()), device=device),
         ]))
         residuals.append(violation)
-        ray_ids.append(frame_index * height * width + projected_v[point_index] * width + projected_u[point_index])
+        frame_number = int(bundle.frame_numbers[frame_index]) if bundle.frame_numbers is not None else frame_index
+        pixel_ids = projected_v[point_index] * width + projected_u[point_index]
+        ray_keys.append(torch.stack([
+            torch.full_like(pixel_ids, int(direction_code)),
+            torch.full_like(pixel_ids, frame_number),
+            pixel_ids,
+        ], dim=1))
         point_ids.append(point_index)
         observation_frames.append(torch.full_like(point_index, frame_index))
     scores = torch.stack(per_frame) if per_frame else torch.empty((0, 4), device=device)
@@ -274,9 +322,10 @@ def evaluate_projected_points(points_world, bundle, surface_mu=0.05, surface_sig
         valid_observation_count=count,
         per_frame_scores=scores,
         per_ray_residuals=torch.cat(residuals) if residuals else empty,
-        ray_ids=torch.cat(ray_ids) if ray_ids else empty.long(),
+        ray_keys=torch.cat(ray_keys) if ray_keys else torch.empty((0, 3), dtype=torch.long, device=device),
         point_ids=torch.cat(point_ids) if point_ids else empty.long(),
         frame_indices=torch.cat(observation_frames) if observation_frames else empty.long(),
+        evaluated_point_count=int(points_world.shape[0]),
     )
 
 
@@ -286,8 +335,8 @@ def bidirectional_ray_evaluation(src_points, tgt_points, pose, source_rays, targ
     tgt_in_source = transform_points(_as_points(tgt_points), torch.linalg.inv(pose))
     src_world = transform_points(src_in_target, target_rays.fragment_pose)
     tgt_world = transform_points(tgt_in_source, source_rays.fragment_pose)
-    target_eval = evaluate_projected_points(src_world, target_rays, surface_mu, surface_sigma, split_id)
-    source_eval = evaluate_projected_points(tgt_world, source_rays, surface_mu, surface_sigma, split_id)
+    target_eval = evaluate_projected_points(src_world, target_rays, surface_mu, surface_sigma, split_id, direction_code=0)
+    source_eval = evaluate_projected_points(tgt_world, source_rays, surface_mu, surface_sigma, split_id, direction_code=1)
     total = target_eval.valid_observation_count + source_eval.valid_observation_count
     if total == 0:
         free, support = 0.0, 0.0
@@ -295,10 +344,14 @@ def bidirectional_ray_evaluation(src_points, tgt_points, pose, source_rays, targ
         free = (target_eval.free_violation * target_eval.valid_observation_count + source_eval.free_violation * source_eval.valid_observation_count) / total
         support = (target_eval.surface_support * target_eval.valid_observation_count + source_eval.surface_support * source_eval.valid_observation_count) / total
     residuals = torch.cat([target_eval.per_ray_residuals, source_eval.per_ray_residuals])
-    ray_ids = torch.cat([target_eval.ray_ids, source_eval.ray_ids])
+    ray_keys = torch.cat([target_eval.ray_keys, source_eval.ray_keys])
     point_ids = torch.cat([target_eval.point_ids, source_eval.point_ids])
     frame_indices = torch.cat([target_eval.frame_indices, source_eval.frame_indices])
     consistency = 1.0 - abs(target_eval.free_violation - source_eval.free_violation) / (target_eval.free_violation + source_eval.free_violation + 1e-8)
+    possible = (
+        target_eval.evaluated_point_count * target_eval.per_frame_scores.shape[0]
+        + source_eval.evaluated_point_count * source_eval.per_frame_scores.shape[0]
+    )
     return {
         "free_violation": float(free),
         "surface_support": float(support),
@@ -306,9 +359,10 @@ def bidirectional_ray_evaluation(src_points, tgt_points, pose, source_rays, targ
         "target": target_eval,
         "source": source_eval,
         "per_ray_residuals": residuals,
-        "ray_ids": ray_ids,
+        "ray_keys": ray_keys,
         "point_ids": point_ids,
         "frame_indices": frame_indices,
+        "valid_observation_ratio": float(total / max(1, possible)),
         "bidirectional_consistency": float(consistency),
     }
 
@@ -375,10 +429,15 @@ def evaluate_pose_batch(poses, src_points, tgt_points, source_rays, target_rays,
     return {"free_violation": free, "surface_support": surface, "valid_observation_count": count}
 
 
-def ray_signature(evaluation, threshold=0.01, bins=32):
-    residuals = evaluation["per_ray_residuals"] if isinstance(evaluation, dict) else evaluation.per_ray_residuals
-    if residuals.numel() == 0:
-        return torch.zeros(bins, dtype=torch.float32, device=residuals.device)
-    values = residuals.detach().float()
-    quantiles = torch.quantile(values, torch.linspace(0, 1, bins + 1, device=values.device))
-    return (quantiles[1:] > float(threshold)).float()
+def ray_signature(evaluation):
+    if isinstance(evaluation, dict):
+        return _canonicalize_residuals(evaluation["ray_keys"], evaluation["per_ray_residuals"])
+    return _canonicalize_residuals(evaluation.ray_keys, evaluation.per_ray_residuals)
+
+
+def detach_ray_signature(signature):
+    return RayResidualSignature(
+        signature.keys.detach().clone(),
+        signature.residuals.detach().clone(),
+        signature.observation_indices.detach().clone(),
+    )

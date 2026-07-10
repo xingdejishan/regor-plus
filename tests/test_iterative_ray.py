@@ -1,4 +1,5 @@
 import inspect
+import json
 import unittest
 
 import torch
@@ -9,9 +10,10 @@ from iterative_ray_config import IterativeRayConfig
 from iterative_ray_search import HypothesisArchive, IterativeRaySearch, RaySelector
 from ray_constraint_builder import EscapeConstraints, RayConstraintBuilder
 from ray_constraint_memory import ConstraintMemory, RejectedBasin
-from ray_evidence import RayBundle, bidirectional_ray_evaluation, evaluate_pose_batch, evaluate_projected_points
+from ray_evidence import RayBundle, RayEvaluation, RayResidualSignature, align_ray_signatures, bidirectional_ray_evaluation, evaluate_pose_batch, evaluate_projected_points, ray_signature
 from ray_guided_regenerator import PoseHypothesis, RayGuidedRegenerator
 from ray_pose_validator import RayPoseValidator
+from test_3DLoMatch import audit_round
 
 
 def bundle(depth=1.0, unknown=False):
@@ -109,6 +111,7 @@ class IterativeRayTests(unittest.TestCase):
         result = bidirectional_ray_evaluation(src, tgt, pose, bundle(), bundle(), split_id=1)
         self.assertEqual(result["valid_observation_count"], 8)
         self.assertEqual(result["free_violation"], 0.0)
+        self.assertLessEqual(result["valid_observation_ratio"], 1.0)
 
     def test_batched_ray_scores_match_single_pose_scores(self):
         src, tgt, pose, _ = points()
@@ -123,9 +126,110 @@ class IterativeRayTests(unittest.TestCase):
     def test_history_basin_requires_signature_match(self):
         _, _, pose, _ = points()
         memory = ConstraintMemory()
-        memory.add(RejectedBasin(1, pose, torch.tensor([1]), torch.tensor([1.0, 0.0]), 1.0, torch.eye(6), 1.0, 1.0))
-        repeated, _, _ = memory.repeated_basin(pose, torch.tensor([0.0, 1.0]), 1.0, 0.9, 0.01)
+        old_signature = RayResidualSignature(torch.tensor([[0, 0, 0], [0, 0, 1]]), torch.tensor([1.0, 0.0]), torch.tensor([0, 1]))
+        new_signature = RayResidualSignature(torch.tensor([[1, 0, 0], [1, 0, 1]]), torch.tensor([0.0, 1.0]), torch.tensor([0, 1]))
+        memory.add(RejectedBasin(1, pose, old_signature.keys, old_signature, 1.0, torch.eye(6), 1.0, 1.0))
+        repeated, _, _ = memory.repeated_basin(pose, new_signature, 1.0, 0.9, 0.01)
         self.assertFalse(repeated)
+
+    def test_constraint_uses_frame_level_camera_pose(self):
+        rotation = torch.eye(4)
+        rotation[1, 1] = 0.0
+        rotation[1, 2] = -1.0
+        rotation[2, 1] = 1.0
+        rotation[2, 2] = 0.0
+        rays = RayBundle(
+            frame_ids=torch.tensor([0]),
+            origins=torch.zeros((1, 3)),
+            directions=torch.tensor([[0.0, 0.0, 1.0]]),
+            observed_depths=torch.ones(1),
+            valid_depth=torch.ones(1, dtype=torch.bool),
+            pixels=torch.zeros((1, 2)),
+            camera_poses=torch.eye(4)[None],
+            intrinsics=torch.eye(3),
+            confidences=torch.ones(1),
+            split_ids=torch.tensor([1]),
+            depth_maps=torch.ones((1, 3, 3)),
+            fragment_pose=torch.eye(4),
+            frame_numbers=torch.tensor([0]),
+            frame_camera_poses=rotation[None],
+            frame_split_ids=torch.tensor([1]),
+        )
+        evaluation = RayEvaluation(
+            0.1,
+            0.0,
+            1,
+            torch.tensor([[0.0, 0.1, 0.0, 1.0]]),
+            torch.tensor([0.1]),
+            torch.tensor([[0, 0, 0]]),
+            torch.tensor([0]),
+            torch.tensor([0]),
+            1,
+        )
+        builder = RayConstraintBuilder(0.05, 0.03)
+        jacobian = builder._target_jacobians(torch.eye(4), torch.tensor([[0.0, 0.0, 0.9]]), rays, evaluation, torch.tensor([0]))
+        self.assertFalse(torch.allclose(jacobian, torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])))
+
+    def test_rotation_escape_uses_six_dof_delta(self):
+        current = torch.eye(4)
+        candidate = torch.eye(4)
+        candidate[0, 0] = torch.cos(torch.tensor(0.8))
+        candidate[0, 1] = -torch.sin(torch.tensor(0.8))
+        candidate[1, 0] = torch.sin(torch.tensor(0.8))
+        candidate[1, 1] = torch.cos(torch.tensor(0.8))
+        constraints = EscapeConstraints(
+            current,
+            (object(),),
+            torch.tensor([[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]),
+            torch.tensor([0.5]),
+            torch.ones(1),
+            torch.zeros(6),
+            torch.eye(6),
+            1,
+            1.0,
+            1.0,
+            1.0,
+            0.5,
+        )
+        score = RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 1.0, 0.2)._escape_score(candidate[None], current, constraints)
+        self.assertAlmostEqual(score, 0.0, places=5)
+
+    def test_opposite_directions_never_share_a_ray_key(self):
+        src, tgt, pose, _ = points()
+        evidence = bidirectional_ray_evaluation(src, tgt, pose, bundle(), bundle(), split_id=1)
+        target_signature = ray_signature(evidence["target"])
+        source_signature = ray_signature(evidence["source"])
+        common_keys, _ = align_ray_signatures([target_signature, source_signature])
+        self.assertEqual(common_keys.shape[0], 0)
+
+    def test_iterative_config_rejects_unknown_and_missing_keys(self):
+        values = search().config.report()
+        values["obsolete_round2_parameter"] = 1
+        with self.assertRaises(KeyError):
+            IterativeRayConfig.from_mapping(values)
+        values = search().config.report()
+        del values["ray_manifest"]
+        with self.assertRaises(KeyError):
+            IterativeRayConfig.from_mapping(values)
+        with open("config_json/config_3DLoMatch_Predator.json", encoding="utf-8") as handle:
+            predator = json.load(handle)
+        self.assertEqual(IterativeRayConfig.from_mapping(predator["iterative_ray"]).validate().method, "iterative_ray")
+
+    def test_oracle_audit_is_limited_to_current_round(self):
+        src, tgt, pose, _ = points()
+        first = PoseHypothesis(0, -1, 0, pose, pose, src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "r1")
+        second = PoseHypothesis(1, 0, 1, pose, pose, src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "ray_guided")
+        future = PoseHypothesis(2, 1, 3, pose, pose, src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "ray_guided")
+        archive = HypothesisArchive(hypotheses=[first, second, future])
+        audits = [
+            {"local_refined_re": 20.0, "local_refined_te": 40.0, "success": 0},
+            {"local_refined_re": 18.0, "local_refined_te": 35.0, "success": 0},
+            {"local_refined_re": 1.0, "local_refined_te": 1.0, "success": 1},
+        ]
+        before = audit_round(archive, audits, 1, 1, 15.0, 30.0)
+        after = audit_round(archive, audits, 3, 2, 15.0, 30.0)
+        self.assertEqual(before["cumulative_oracle_success"], 0)
+        self.assertEqual(after["cumulative_oracle_success"], 1)
 
     def test_active_max_rounds_executes_real_loop(self):
         src, tgt, pose, features = points()

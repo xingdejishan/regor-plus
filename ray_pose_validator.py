@@ -43,7 +43,7 @@ class RayPoseValidator:
             free_violation=float(evidence["free_violation"]),
             surface_support=float(evidence["surface_support"]),
             valid_observation_count=int(evidence["valid_observation_count"]),
-            valid_observation_ratio=float(evidence["valid_observation_count"] / max(1, total_frames)),
+            valid_observation_ratio=float(evidence["valid_observation_ratio"]),
             frame_coverage=float(covered_frames / max(1, total_frames)),
             bidirectional_consistency=float(evidence["bidirectional_consistency"]),
             insufficient_evidence=insufficient,

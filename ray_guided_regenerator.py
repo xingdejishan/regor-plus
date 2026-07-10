@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 import torch
 
 from common import rigid_transform_3d
-from ray_evidence import transform_points
 
 
 @dataclass
@@ -31,7 +30,7 @@ class PoseHypothesis:
     nearest_history_distance: float = float("inf")
     signature_similarity: float = 0.0
     insufficient_evidence: bool = False
-    ray_signature: torch.Tensor | None = None
+    ray_signature: object | None = None
 
     @property
     def pose(self):
@@ -82,14 +81,46 @@ class RayGuidedRegenerator:
         source = torch.arange(cache.topk_indices.shape[0], device=cache.topk_indices.device)[:, None].expand_as(cache.topk_indices)
         return torch.stack([source.reshape(-1), cache.topk_indices.reshape(-1)], dim=1), cache.topk_scores.reshape(-1)
 
-    def _escape_score(self, current_pose, src_points, tgt_points, pairs, constraints):
+    @staticmethod
+    def _se3_log(transform):
+        rotation = transform[:3, :3]
+        translation = transform[:3, 3]
+        cosine = torch.clamp((torch.trace(rotation) - 1.0) * 0.5, -1.0, 1.0)
+        theta = torch.acos(cosine)
+        vee = torch.stack([
+            rotation[2, 1] - rotation[1, 2],
+            rotation[0, 2] - rotation[2, 0],
+            rotation[1, 0] - rotation[0, 1],
+        ])
+        if theta < 1e-5:
+            omega = 0.5 * vee
+        else:
+            omega = theta * vee / torch.clamp_min(2.0 * torch.sin(theta), 1e-6)
+        wx, wy, wz = omega
+        zero = torch.zeros((), dtype=transform.dtype, device=transform.device)
+        skew = torch.stack([
+            torch.stack([zero, -wz, wy]),
+            torch.stack([wz, zero, -wx]),
+            torch.stack([-wy, wx, zero]),
+        ])
+        identity = torch.eye(3, dtype=transform.dtype, device=transform.device)
+        if theta < 1e-5:
+            inverse_jacobian = identity - 0.5 * skew + (skew @ skew) / 12.0
+        else:
+            a = torch.sin(theta) / theta
+            b = (1.0 - torch.cos(theta)) / (theta * theta)
+            coefficient = (1.0 - a / torch.clamp_min(2.0 * b, 1e-6)) / (theta * theta)
+            inverse_jacobian = identity - 0.5 * skew + coefficient * (skew @ skew)
+        return torch.cat([omega, inverse_jacobian @ translation])
+
+    def _escape_score(self, candidate_pose, current_pose, constraints):
         if not constraints.constraints:
-            return torch.zeros(pairs.shape[0], dtype=src_points.dtype, device=src_points.device)
-        transformed = transform_points(src_points[pairs[:, 0]], current_pose)
-        translation = tgt_points[pairs[:, 1]] - transformed
-        delta = torch.cat([torch.zeros_like(translation), translation], dim=1)
-        residual = torch.relu(constraints.b[None] - delta @ constraints.G.transpose(0, 1))
-        return -(residual * constraints.weights[None]).mean(dim=1)
+            return 0.0
+        current = current_pose[0] if current_pose.ndim == 3 else current_pose
+        candidate = candidate_pose[0] if candidate_pose.ndim == 3 else candidate_pose
+        delta = self._se3_log(candidate @ torch.linalg.inv(current))
+        residual = torch.relu(constraints.b - constraints.G @ delta)
+        return float(-(residual * constraints.weights).mean().item())
 
     def _select_seed_groups(self, pairs, scores, src_points, tgt_points, group_count, explore_count, offset=0):
         order = torch.argsort(scores, descending=True)
@@ -163,40 +194,75 @@ class RayGuidedRegenerator:
         current_pose = getattr(constraints, "current_pose", None)
         if current_pose is None:
             raise ValueError("EscapeConstraints must carry current_pose for correspondence scoring.")
-        escape_scores = self._escape_score(current_pose, src, tgt, pairs, constraints)
-        approximate_pose = current_pose.clone().expand(pairs.shape[0], -1, -1).clone()
-        approximate_pose[:, :3, 3] += tgt[pairs[:, 1]] - transform_points(src[pairs[:, 0]], current_pose)
-        history_scores = memory.pose_penalty_batch(approximate_pose)
-        guided_scores = descriptor_scores + self.escape_lambda * escape_scores - self.history_lambda * history_scores
         output_count = min(int(candidate_count), self.seed_group_count) if self.seed_group_count is not None else int(candidate_count)
         explore_count = int(round(output_count * self.independent_explore_fraction))
         guided_count = max(0, output_count - explore_count)
-        groups = self._select_seed_groups(pairs, guided_scores, src, tgt, guided_count, 0, round_id * max(1, candidate_count))
-        independent_groups = self._select_seed_groups(pairs, descriptor_scores, src, tgt, explore_count, explore_count, round_id * max(1, explore_count))
-        hypotheses = []
-        selected_groups = [(pairs[group], guided_scores[group], mode) for group, mode in groups]
-        selected_groups.extend((pairs[group], descriptor_scores[group], mode) for group, mode in independent_groups)
+        pool_count = max(output_count, self.seed_group_count or output_count)
+        guided_groups = self._select_seed_groups(pairs, descriptor_scores, src, tgt, pool_count, 0, round_id * max(1, candidate_count))
+        independent_groups = self._select_seed_groups(pairs, descriptor_scores, src, tgt, pool_count, 0, round_id * max(1, explore_count))
+
+        def score_group(group, mode):
+            group_pairs = pairs[group]
+            grouped_src = src[group_pairs[:, 0]][None]
+            grouped_tgt = tgt[group_pairs[:, 1]][None]
+            pose_raw = rigid_transform_3d(grouped_src, grouped_tgt)
+            descriptor_score = float(descriptor_scores[group].mean().item())
+            escape_score = self._escape_score(pose_raw, current_pose, constraints) if mode != "independent" else 0.0
+            history_penalty = float(memory.pose_penalty_batch(pose_raw).mean().item())
+            score = descriptor_score + self.escape_lambda * escape_score - self.history_lambda * history_penalty
+            return {
+                "pairs": group_pairs,
+                "descriptor_scores": descriptor_scores[group],
+                "pose_raw": pose_raw,
+                "descriptor_score": descriptor_score,
+                "escape_score": escape_score,
+                "history_penalty": history_penalty,
+                "score": score,
+                "mode": mode,
+            }
+
+        guided_records = [score_group(group, "ray_guided") for group, _ in guided_groups]
+        independent_records = [score_group(group, "independent") for group, _ in independent_groups]
+        guided_records.sort(key=lambda record: record["score"], reverse=True)
+        independent_records.sort(key=lambda record: record["descriptor_score"], reverse=True)
+        selected_records = guided_records[:guided_count] + independent_records[:explore_count]
         explicit_groups = self._explicit_seed_groups(seed_src, seed_tgt, src, tgt)
         if explicit_groups:
-            selected_groups = [(group, torch.zeros(group.shape[0], device=src.device, dtype=src.dtype), "explicit_seed") for group in explicit_groups] + selected_groups
-        for group_pairs, group_scores, mode in selected_groups[:output_count]:
+            explicit_records = []
+            for group_pairs in explicit_groups:
+                grouped_src = src[group_pairs[:, 0]][None]
+                grouped_tgt = tgt[group_pairs[:, 1]][None]
+                pose_raw = rigid_transform_3d(grouped_src, grouped_tgt)
+                explicit_records.append({
+                    "pairs": group_pairs,
+                    "descriptor_scores": torch.zeros(group_pairs.shape[0], device=src.device, dtype=src.dtype),
+                    "pose_raw": pose_raw,
+                    "descriptor_score": 0.0,
+                    "escape_score": self._escape_score(pose_raw, current_pose, constraints),
+                    "history_penalty": float(memory.pose_penalty_batch(pose_raw).mean().item()),
+                    "score": 0.0,
+                    "mode": "explicit_seed",
+                })
+            selected_records = explicit_records + selected_records
+        hypotheses = []
+        for record in selected_records[:output_count]:
+            group_pairs = record["pairs"]
             grouped_src = src[group_pairs[:, 0]][None]
             grouped_tgt = tgt[group_pairs[:, 1]][None]
             corr_src, corr_tgt, pose_refined = self._local_refine(grouped_src, grouped_tgt, src_points, tgt_points, src_features, tgt_features)
-            pose_raw = rigid_transform_3d(grouped_src, grouped_tgt)
             hypotheses.append(PoseHypothesis(
                 hypothesis_id=-1,
                 parent_id=int(parent_id),
                 round_id=int(round_id),
-                pose_raw=pose_raw,
+                pose_raw=record["pose_raw"],
                 pose_local_refined=pose_refined,
                 src_corr=corr_src,
                 tgt_corr=corr_tgt,
-                correspondence_scores=group_scores,
+                correspondence_scores=record["descriptor_scores"],
                 seed_ids=group_pairs.detach().clone(),
-                generation_mode=mode,
-                descriptor_score=float(group_scores.mean().item()),
-                predicted_escape_score=float(self._escape_score(current_pose, src, tgt, group_pairs, constraints).mean().item()) if mode == "ray_guided" else 0.0,
-                history_penalty=float(memory.pose_penalty_batch(pose_raw).mean().item()),
+                generation_mode=record["mode"],
+                descriptor_score=record["descriptor_score"],
+                predicted_escape_score=record["escape_score"],
+                history_penalty=record["history_penalty"],
             ))
         return hypotheses

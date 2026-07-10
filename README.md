@@ -66,23 +66,21 @@ python test_3DMatch.py --config_path config_json/config_3DMatch_FCGF.json
 python test_3DMatch.py --config_path config_json/config_3DMatch_FPFH.json
 ```
 
-3DLoMatch + FCGF：
+IRIS-Reg 3DLoMatch + FPFH（当前提供 redkitchen RGB-D manifest）：
 
 ```bash
-python test_3DLoMatch.py --config_path config_json/config_3DLoMatch_FCGF.json
+python test_3DLoMatch.py --config_path config_json/config_3DLoMatch_FPFH_redkitchen_modified.json
 ```
 
-3DLoMatch + FPFH：
-
-```bash
-python test_3DLoMatch.py --config_path config_json/config_3DLoMatch_FPFH.json
-```
-
-3DLoMatch + Predator：
+IRIS-Reg 3DLoMatch + Predator：
 
 ```bash
 python test_3DLoMatch.py --config_path config_json/config_3DLoMatch_Predator.json
 ```
+
+两个 IRIS-Reg 配置都使用 `./3dmatch_raw/test` 和 `data/3DMatch/free_space/redkitchen_manifest.json`。当前仓库仅包含 redkitchen 的原始 RGB-D 与 manifest，因此两者的 `max_pairs=525` 只覆盖该子集；缺少其他场景 manifest 时程序会直接报错，不会退化为几何 proxy。
+
+旧的 `config_3DLoMatch_FCGF.json`、`config_3DLoMatch_FPFH.json` 仍是传统 REGOR 配置，不能传给新的迭代射线入口。`IterativeRayConfig` 会拒绝未知字段和缺失字段，避免把旧 `active_round2_*` 参数静默忽略。
 
 当前 Predator 特征已由 `external/OverlapPredator` 导出到：
 
@@ -92,7 +90,15 @@ external/OverlapPredator/snapshot/indoor/3DLoMatch/
 
 共 `0.pth` 到 `1780.pth`，Regor 的 `config_json/config_3DLoMatch_Predator.json` 已指向该目录。
 
-日志会写入 `logs/`。
+每次运行会在配置的 `output_dir` 下写入 `pair_results.csv`、`round_logs.csv`、`candidate_logs.csv` 和 `metrics.json`。
+
+四组独立对照使用相同随机种子并共享 R1 cache：
+
+```bash
+python scripts/run_iterative_ray_ablations.py --config-path config_json/config_3DLoMatch_Predator.json
+```
+
+该脚本分别运行 `r1_only`、`repeated_regor`、`iterative_ray` 与 `shuffled_ray`；不会在单次入口内隐式重复四遍实验。
 
 ## 已补齐内容
 

@@ -2,13 +2,15 @@ from dataclasses import dataclass, field
 
 import torch
 
+from ray_evidence import RayResidualSignature, align_ray_signatures
+
 
 @dataclass(frozen=True)
 class RejectedBasin:
     hypothesis_id: int
     pose: torch.Tensor
-    ray_ids: torch.Tensor
-    ray_signature: torch.Tensor
+    ray_keys: torch.Tensor
+    ray_signature: RayResidualSignature
     search_energy: float
     local_information_matrix: torch.Tensor
     rotation_radius: float
@@ -51,12 +53,10 @@ class ConstraintMemory:
     def repeated_basin(self, pose, signature, search_energy, signature_similarity, energy_tolerance):
         for basin in self.basins:
             distance = self.pose_distance(pose, basin.pose, basin.rotation_radius, basin.translation_radius)
-            if basin.ray_signature.numel() and signature.numel():
-                similarity = float(torch.nn.functional.cosine_similarity(
-                    signature.float().view(1, -1), basin.ray_signature.float().view(1, -1), dim=1,
-                ).item())
-            else:
-                similarity = 0.0
+            _, residuals = align_ray_signatures([signature, basin.ray_signature])
+            similarity = float(torch.nn.functional.cosine_similarity(
+                residuals[0].view(1, -1), residuals[1].view(1, -1), dim=1,
+            ).item()) if residuals.shape[1] else 0.0
             unresolved = float(search_energy) >= basin.search_energy - float(energy_tolerance)
             if distance < 1.0 and similarity >= signature_similarity and unresolved:
                 return True, float(distance.item()), similarity

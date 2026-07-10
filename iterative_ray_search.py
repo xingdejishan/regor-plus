@@ -6,7 +6,7 @@ import torch
 
 from ray_constraint_builder import RayConstraintBuilder
 from ray_constraint_memory import ConstraintMemory, RejectedBasin
-from ray_evidence import bidirectional_ray_evaluation
+from ray_evidence import align_ray_signatures, bidirectional_ray_evaluation, detach_ray_signature, ray_signature
 from ray_guided_regenerator import PoseHypothesis
 from ray_pose_validator import RayPoseValidator
 
@@ -56,27 +56,40 @@ class RaySelector:
         self.active_ray_count = int(active_ray_count)
         self._uses = {}
 
-    def _rank(self, evaluation, comparison_evaluations):
-        if evaluation.per_ray_residuals.numel() == 0:
-            return torch.empty(0, dtype=torch.long, device=evaluation.per_ray_residuals.device)
+    @staticmethod
+    def _codes(keys, reference):
+        combined = torch.cat([keys, reference], dim=0)
+        pixel_scale = int(combined[:, 2].max().item()) + 1
+        frame_scale = int(combined[:, 1].max().item()) + 1
+        return keys[:, 0] * frame_scale * pixel_scale + keys[:, 1] * pixel_scale + keys[:, 2]
+
+    def _rank(self, signature, comparison_signatures):
+        if signature.residuals.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=signature.residuals.device)
         use_penalty = torch.tensor(
-            [self._uses.get(int(ray_id), 0) for ray_id in evaluation.ray_ids.tolist()],
-            device=evaluation.per_ray_residuals.device,
-            dtype=evaluation.per_ray_residuals.dtype,
+            [self._uses.get(tuple(key), 0) for key in signature.keys.tolist()],
+            device=signature.residuals.device,
+            dtype=signature.residuals.dtype,
         )
-        comparable = [value.per_ray_residuals for value in comparison_evaluations if value.per_ray_residuals.shape == evaluation.per_ray_residuals.shape]
-        disagreement = torch.var(torch.stack(comparable), dim=0, unbiased=False) if len(comparable) > 1 else torch.zeros_like(evaluation.per_ray_residuals)
-        score = evaluation.per_ray_residuals + disagreement.sqrt() + 0.01 / (1.0 + use_penalty)
+        disagreement = torch.zeros_like(signature.residuals)
+        common_keys, common_residuals = align_ray_signatures([signature, *comparison_signatures])
+        if common_residuals.shape[0] > 1 and common_residuals.shape[1]:
+            signature_codes = self._codes(signature.keys, common_keys)
+            common_codes = self._codes(common_keys, signature.keys)
+            sort_codes, sorter = torch.sort(signature_codes)
+            positions = sorter[torch.searchsorted(sort_codes, common_codes)]
+            disagreement[positions] = torch.var(common_residuals, dim=0, unbiased=False).sqrt()
+        score = signature.residuals + disagreement + 0.01 / (1.0 + use_penalty)
         return torch.argsort(score, descending=True)
 
-    def _take_diverse(self, evaluation, order, count):
+    def _take_diverse(self, signature, order, count):
         if count == 0:
             return order[:0]
-        frames = torch.unique(evaluation.frame_indices[order])
+        frames = torch.unique(signature.keys[order, 1])
         frame_cap = max(1, math.ceil(count / max(1, frames.numel())))
         selected, per_frame = [], {}
         for index in order.tolist():
-            frame = int(evaluation.frame_indices[index])
+            frame = int(signature.keys[index, 1])
             if per_frame.get(frame, 0) >= frame_cap:
                 continue
             selected.append(index)
@@ -88,24 +101,29 @@ class RaySelector:
         return torch.tensor(selected[:count], device=order.device, dtype=torch.long)
 
     def select(self, search_evaluation, archive):
-        target_comparisons = [item.search_evaluation["target"] for item in archive.hypotheses if hasattr(item, "search_evaluation")]
-        source_comparisons = [item.search_evaluation["source"] for item in archive.hypotheses if hasattr(item, "search_evaluation")]
-        target_order = self._rank(search_evaluation["target"], target_comparisons)
-        source_order = self._rank(search_evaluation["source"], source_comparisons)
+        target_signature = ray_signature(search_evaluation["target"])
+        source_signature = ray_signature(search_evaluation["source"])
+        target_comparisons = [ray_signature(item.search_evaluation["target"]) for item in archive.hypotheses if hasattr(item, "search_evaluation")]
+        source_comparisons = [ray_signature(item.search_evaluation["source"]) for item in archive.hypotheses if hasattr(item, "search_evaluation")]
+        target_order = self._rank(target_signature, target_comparisons)
+        source_order = self._rank(source_signature, source_comparisons)
         target_count = min((self.active_ray_count + 1) // 2, target_order.numel())
         source_count = min(self.active_ray_count - target_count, source_order.numel())
         if source_count < self.active_ray_count // 4 and target_order.numel() > target_count:
             target_count = min(self.active_ray_count - source_count, target_order.numel())
-        target_indices = self._take_diverse(search_evaluation["target"], target_order, target_count)
-        source_indices = self._take_diverse(search_evaluation["source"], source_order, source_count)
-        ray_ids = torch.cat([
-            search_evaluation["target"].ray_ids[target_indices],
-            search_evaluation["source"].ray_ids[source_indices],
+        target_signature_indices = self._take_diverse(target_signature, target_order, target_count)
+        source_signature_indices = self._take_diverse(source_signature, source_order, source_count)
+        target_indices = target_signature.observation_indices[target_signature_indices]
+        source_indices = source_signature.observation_indices[source_signature_indices]
+        ray_keys = torch.cat([
+            target_signature.keys[target_signature_indices],
+            source_signature.keys[source_signature_indices],
         ])
-        new_count = sum(int(ray_id) not in self._uses for ray_id in ray_ids.tolist())
-        for ray_id in ray_ids.tolist():
-            self._uses[int(ray_id)] = self._uses.get(int(ray_id), 0) + 1
-        return RaySelection(target_indices, source_indices, int(ray_ids.numel()), int(new_count))
+        new_count = sum(tuple(key) not in self._uses for key in ray_keys.tolist())
+        for key in ray_keys.tolist():
+            canonical_key = tuple(key)
+            self._uses[canonical_key] = self._uses.get(canonical_key, 0) + 1
+        return RaySelection(target_indices, source_indices, int(ray_keys.shape[0]), int(new_count))
 
 
 class IterativeRaySearch:
@@ -290,8 +308,8 @@ class IterativeRaySearch:
                 memory.add(RejectedBasin(
                     hypothesis_id=rejected_hypothesis.hypothesis_id,
                     pose=rejected_hypothesis.pose.detach().clone(),
-                    ray_ids=torch.cat([search_evidence["target"].ray_ids, search_evidence["source"].ray_ids]).detach().clone(),
-                    ray_signature=rejected_hypothesis.ray_signature.detach().clone(),
+                    ray_keys=torch.cat([search_evidence["target"].ray_keys, search_evidence["source"].ray_keys]).detach().clone(),
+                    ray_signature=detach_ray_signature(rejected_hypothesis.ray_signature),
                     search_energy=float(rejected_hypothesis.search_ray_score),
                     local_information_matrix=constraints.information_matrix.detach().clone(),
                     rotation_radius=math.radians(self.config.history_rotation_radius_deg),

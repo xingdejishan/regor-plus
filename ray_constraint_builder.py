@@ -7,7 +7,7 @@ from ray_evidence import RayEvaluation, bidirectional_ray_evaluation, transform_
 
 @dataclass(frozen=True)
 class RayConstraint:
-    ray_id: int
+    ray_key: torch.Tensor
     point_id: int
     violation_depth: float
     pose_jacobian: torch.Tensor
@@ -70,7 +70,7 @@ class RayConstraintBuilder:
         point_ids = evaluation.point_ids[selected]
         frame_ids = evaluation.frame_indices[selected]
         local = transform_points(src_points[point_ids], pose)
-        camera = torch.linalg.inv(target_rays.camera_poses[frame_ids])[:, :3, :3]
+        camera = torch.linalg.inv(target_rays.projection_poses[frame_ids])[:, :3, :3]
         fragment_rotation = target_rays.fragment_pose[:3, :3].expand(point_ids.numel(), -1, -1)
         projection = camera @ fragment_rotation
         local_jacobian = torch.cat([-_skew(local), torch.eye(3, device=pose.device, dtype=pose.dtype).expand(point_ids.numel(), -1, -1)], dim=-1)
@@ -82,7 +82,7 @@ class RayConstraintBuilder:
         point_ids = evaluation.point_ids[selected]
         frame_ids = evaluation.frame_indices[selected]
         target_points = tgt_points[point_ids]
-        camera = torch.linalg.inv(source_rays.camera_poses[frame_ids])[:, :3, :3]
+        camera = torch.linalg.inv(source_rays.projection_poses[frame_ids])[:, :3, :3]
         source_fragment_rotation = source_rays.fragment_pose[:3, :3].expand(point_ids.numel(), -1, -1)
         inverse_rotation = pose[:3, :3].transpose(0, 1).expand(point_ids.numel(), -1, -1)
         local_jacobian = torch.cat([_skew(target_points), -torch.eye(3, device=pose.device, dtype=pose.dtype).expand(point_ids.numel(), -1, -1)], dim=-1)
@@ -135,10 +135,10 @@ class RayConstraintBuilder:
         preferred = preferred / torch.clamp_min(torch.linalg.norm(preferred), 1e-8)
         records = []
         for local_index, index in enumerate(target_selected.tolist()):
-            records.append(RayConstraint(int(target_eval.ray_ids[index]), int(target_eval.point_ids[index]), float(target_eval.per_ray_residuals[index]), target_G[local_index], float(weights[local_index]), int(target_eval.frame_indices[index]), "source_to_target"))
+            records.append(RayConstraint(target_eval.ray_keys[index].detach().clone(), int(target_eval.point_ids[index]), float(target_eval.per_ray_residuals[index]), target_G[local_index], float(weights[local_index]), int(target_eval.frame_indices[index]), "source_to_target"))
         offset = target_selected.numel()
         for local_index, index in enumerate(source_selected.tolist()):
-            records.append(RayConstraint(int(source_eval.ray_ids[index]), int(source_eval.point_ids[index]), float(source_eval.per_ray_residuals[index]), source_G[local_index], float(weights[offset + local_index]), int(source_eval.frame_indices[index]), "target_to_source"))
+            records.append(RayConstraint(source_eval.ray_keys[index].detach().clone(), int(source_eval.point_ids[index]), float(source_eval.per_ray_residuals[index]), source_G[local_index], float(weights[offset + local_index]), int(source_eval.frame_indices[index]), "target_to_source"))
         return EscapeConstraints(
             pose, tuple(records), G, b, weights, preferred, information, rank, condition,
             float(torch.trace(information[:3, :3]).item()), float(torch.trace(information[3:, 3:]).item()),

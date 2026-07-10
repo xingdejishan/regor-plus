@@ -45,8 +45,16 @@ class IterativeRayConfig:
 
     @classmethod
     def from_mapping(cls, values):
+        if not isinstance(values, dict):
+            values = dict(values)
         allowed = {field.name for field in fields(cls)}
-        return cls(**{key: values[key] for key in allowed if key in values})
+        unknown = sorted(set(values) - allowed)
+        if unknown:
+            raise KeyError(f"Unknown iterative_ray config keys: {', '.join(unknown)}")
+        missing = sorted(allowed - set(values))
+        if missing:
+            raise KeyError(f"Missing iterative_ray config keys: {', '.join(missing)}")
+        return cls(**{key: values[key] for key in allowed})
 
     def validate(self):
         if self.method not in {"r1_only", "iterative_ray", "repeated_regor", "shuffled_ray"}:
@@ -67,6 +75,8 @@ class IterativeRayConfig:
             raise ValueError("active_rays_per_round or search_frame_fraction is invalid.")
         if self.ray_trunc_margin <= 0 or self.ray_surface_sigma <= 0 or self.min_valid_ray_count < 1:
             raise ValueError("ray evidence settings are invalid.")
+        if not self.ray_manifest:
+            raise ValueError("ray_manifest must be a non-empty fragment manifest path.")
         if self.max_constraints_per_frame < 1:
             raise ValueError("max_constraints_per_frame must be positive.")
         if self.pose_nms_rotation_deg <= 0 or self.pose_nms_translation <= 0 or self.pose_nms_threshold <= 0:

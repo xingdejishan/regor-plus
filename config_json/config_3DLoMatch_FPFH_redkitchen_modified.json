@@ -19,6 +19,8 @@
   "NS_by_IC": 50,
   "r1_knn": 100,
   "r1_sampling": 100,
+  "seed": 51,
+  "r1_cache_dir": "./outputs/iterative_ray_redkitchen/r1_cache",
   "re_thre": 15,
   "te_thre": 30,
   "max_pairs": 525,
