@@ -137,6 +137,26 @@ def add_group(groups, key, row):
     groups[key].append(row)
 
 
+def serialize_r1_topk(topk_trans, src_corr, tgt_corr, gt_trans, config):
+    from utils.SE3 import transform
+
+    matrices = topk_trans[0].detach().cpu().tolist()
+    scores = []
+    for rank in range(topk_trans.shape[1]):
+        candidate = topk_trans[:, rank, :, :]
+        residual = torch.norm(transform(src_corr, candidate) - tgt_corr, dim=-1)[0]
+        model_inlier_count = int((residual < config.active_overlap_threshold).sum().item())
+        success, re, te = pose_success(candidate, gt_trans, config.re_thre, config.te_thre)
+        scores.append({
+            "rank": rank,
+            "model_inlier_count": model_inlier_count,
+            "gt_success": success,
+            "gt_re": re,
+            "gt_te": te,
+        })
+    return json.dumps(matrices, separators=(",", ":")), json.dumps(scores, separators=(",", ":"))
+
+
 def evaluate(args):
     os.chdir(REPO_ROOT)
     config = load_config(args.config_path)
@@ -148,7 +168,6 @@ def evaluate(args):
     from initial_matching_plus import Matcher_plus
     from test_3DLoMatch import (
         active_param,
-        attach_guided_candidate_pools,
         build_guided_prior,
         generate_r1_topk_transforms,
         robust_weighted_estimate,
@@ -201,6 +220,8 @@ def evaluate(args):
         num_pairs = min(num_pairs, args.max_pairs)
 
     rows = []
+    triggered_rows = []
+    candidate_rows = []
     groups = defaultdict(list)
 
     with torch.no_grad():
@@ -277,40 +298,77 @@ def evaluate(args):
                 diagnostics["fsv_value"] < active_param(config, "active_tau_fsv")
                 and diagnostics["roc_bar"] > active_param(config, "active_tau_rho")
             )
+            t_best_success, t_best_re, t_best_te = pose_success(t_best, gt_trans, config.re_thre, config.te_thre)
+            r1_topk_trans_json, r1_topk_s2_json = serialize_r1_topk(
+                r1_topk_trans,
+                r1_src_corr,
+                r1_tgt_corr,
+                gt_trans,
+                config,
+            )
             enter_round2 = (
                 active_param(config, "use_round2")
                 and active_param(config, "active_max_rounds") >= 2
                 and active_param(config, "round2_mode") != "none"
                 and not early_stop
             )
+            pair_meta = {
+                "pair_id": pair_idx,
+                "pair_index": pair_idx,
+                "scene": loader.infos["src"][pair_idx].split("/")[1],
+                "src_fragment": loader.infos["src"][pair_idx].split("/")[-1],
+                "tgt_fragment": loader.infos["tgt"][pair_idx].split("/")[-1],
+                "R1_success": t_best_success,
+                "fsv_value": float(diagnostics["fsv_value"]),
+                "roc_bar": float(diagnostics["roc_bar"]),
+                "enter_round2": int(enter_round2),
+                "R2_success": None,
+                "r1_topk_trans_json": r1_topk_trans_json,
+                "r1_topk_s2_json": r1_topk_s2_json,
+            }
             if not enter_round2:
+                rows.append(pair_meta)
+                if len(rows) % args.progress_interval == 0:
+                    print(f"audited pairs {len(rows)}, scanned {pair_idx + 1}/{num_pairs}")
                 continue
 
             round2_mode = active_param(config, "round2_mode")
             regenerate_mode = "local"
-            regenerate_guide = None
+            regenerate_guide = {
+                "local_radius": active_param(config, "active_round2_local_radius"),
+                "local_max_points": active_param(config, "active_round2_local_max_points"),
+                "generalized_mutual_k": active_param(config, "active_round2_mutual_k"),
+                "max_matches_per_seed": active_param(config, "active_round2_knn"),
+            }
             if round2_mode == "original":
                 r2_seed_src, r2_seed_tgt = sample_correspondences(
-                    seed_src_corr,
-                    seed_tgt_corr,
+                    r1_src_corr,
+                    r1_tgt_corr,
                     active_param(config, "active_round2_sampling"),
                 )
+                regenerate_mode = "paired_local"
             elif round2_mode == "random_uniform":
                 r2_seed_src, r2_seed_tgt = sample_random_uniform_seed_correspondences(
                     src_keypts,
                     tgt_keypts,
                     active_param(config, "active_round2_sampling"),
                 )
+                regenerate_mode = "paired_local"
             elif round2_mode == "weakness_guided":
-                guide = attach_guided_candidate_pools(guide, src_keypts, tgt_keypts, config)
                 r2_seed_src, r2_seed_tgt = sample_guided_seed_correspondences(
                     src_keypts,
                     tgt_keypts,
                     src_features,
                     tgt_features,
+                    r1_src_corr,
+                    r1_tgt_corr,
                     guide,
                     active_param(config, "active_round2_sampling"),
                 )
+                guide["local_radius"] = active_param(config, "active_round2_local_radius")
+                guide["local_max_points"] = active_param(config, "active_round2_local_max_points")
+                guide["generalized_mutual_k"] = active_param(config, "active_round2_mutual_k")
+                guide["max_matches_per_seed"] = active_param(config, "active_round2_knn")
                 regenerate_mode = "guided_global"
                 regenerate_guide = guide
             else:
@@ -326,9 +384,41 @@ def evaluate(args):
                 gt_trans,
                 knn_num=active_param(config, "active_round2_knn"),
                 sampling_num=active_param(config, "active_round2_sampling"),
+                knn_radius=active_param(config, "active_round2_local_radius"),
                 guide=regenerate_guide,
                 mode=regenerate_mode,
             )
+            for candidate in regenerator.last_r2_candidates:
+                candidate_trans = candidate["candidate_trans"]
+                if candidate_trans is not None:
+                    candidate_trans_for_error = candidate_trans.to(gt_trans.device)
+                    candidate_re, candidate_te = pose_errors(candidate_trans_for_error, gt_trans)
+                    candidate_pose_json = json.dumps(candidate_trans[0].tolist(), separators=(",", ":"))
+                else:
+                    candidate_re = None
+                    candidate_te = None
+                    candidate_pose_json = ""
+                candidate_rows.append({
+                    "pair_id": pair_idx,
+                    "pair_index": pair_idx,
+                    "scene": loader.infos["src"][pair_idx].split("/")[1],
+                    "src_fragment": loader.infos["src"][pair_idx].split("/")[-1],
+                    "tgt_fragment": loader.infos["tgt"][pair_idx].split("/")[-1],
+                    "round2_mode": round2_mode,
+                    "seed_id": candidate["seed_id"],
+                    "seed_src_index": candidate["seed_src_index"],
+                    "seed_tgt_index": candidate["seed_tgt_index"],
+                    "S2": candidate["s2"],
+                    "S2_sum": candidate["s2_sum"],
+                    "correspondence_count": candidate["correspondence_count"],
+                    "model_inlier_count": candidate["model_inlier_count"],
+                    "valid_pose": candidate["valid_pose"],
+                    "RE": candidate_re,
+                    "TE": candidate_te,
+                    "candidate_trans_json": candidate_pose_json,
+                })
+            if r2_src_corr.shape[1] < 3:
+                t_r2 = t_best
 
             src_final = torch.cat([r1_src_corr, r2_src_corr], dim=1)
             tgt_final = torch.cat([r1_tgt_corr, r2_tgt_corr], dim=1)
@@ -361,10 +451,7 @@ def evaluate(args):
             r2_seed_gt_overlap = gt_overlap_mask(r2_seed_src[0], tgt_keypts[0], gt_trans, config.inlier_threshold)
             actual_gt_overlap = gt_overlap_mask(actual_source, tgt_keypts[0], gt_trans, config.inlier_threshold)
 
-            if "source_candidate_indices" in guide:
-                selected_indices = guide["source_candidate_indices"].long()
-            else:
-                selected_indices = topk_idx
+            selected_indices = topk_idx
             selected_region_counts = region_counts(selected_indices, guide, active_param(config, "active_eps"))
             actual_nearest = torch.argmin(torch.cdist(actual_source, src_keypts[0]), dim=1) if actual_source.shape[0] else torch.empty(0, dtype=torch.long, device=src_keypts.device)
             actual_region_counts = region_counts(actual_nearest, guide, active_param(config, "active_eps")) if actual_nearest.numel() else {
@@ -396,7 +483,6 @@ def evaluate(args):
                 active_param(config, "active_voxel_size"),
             )
 
-            t_best_success, t_best_re, t_best_te = pose_success(t_best, gt_trans, config.re_thre, config.te_thre)
             t_r1_success, t_r1_re, t_r1_te = pose_success(t_best, gt_trans, config.re_thre, config.te_thre)
             t_r1_only_final_success, t_r1_only_final_re, t_r1_only_final_te = pose_success(
                 t_r1_final,
@@ -408,6 +494,7 @@ def evaluate(args):
             t_final_success, t_final_re, t_final_te = pose_success(t_final, gt_trans, config.re_thre, config.te_thre)
 
             row = {
+                **pair_meta,
                 "pair_index": pair_idx,
                 "round2_mode": round2_mode,
                 "generation_region": generation_region,
@@ -426,6 +513,12 @@ def evaluate(args):
                 "o_top_percentile_gt_overlap_rate": bool_mean(gt_src_overlap[percentile_idx]),
                 "r2_seed_source_count": int(r2_seed_src.shape[1]),
                 "r2_seed_source_gt_overlap_rate": bool_mean(r2_seed_gt_overlap),
+                "r2_exploit_quota": int(guide.get("round2_num_exploit", 0)),
+                "r2_explore_quota": int(guide.get("round2_num_explore", 0)),
+                "r2_exploit_seed_count": int(guide.get("round2_exploit_seed_count", 0)),
+                "r2_explore_seed_count": int(guide.get("round2_explore_seed_count", 0)),
+                "r2_explore_compatibility_fallback": int(guide.get("round2_explore_compatibility_fallback", False)),
+                "r2_candidate_pose_count": len(regenerator.last_r2_candidates),
                 "r2_sampled_source_count": int(actual_source.shape[0]),
                 "r2_sampled_source_gt_overlap_rate": bool_mean(actual_gt_overlap),
                 "r2_corr_count": r2_corr_count,
@@ -457,12 +550,14 @@ def evaluate(args):
                 "actual_reset_nonexclusive_rate": actual_region_counts["reset_nonexclusive_rate"],
                 "actual_outside_rate": actual_region_counts["outside_rate"],
             }
+            row["R2_success"] = t_r2_success
             rows.append(row)
+            triggered_rows.append(row)
             add_group(groups, f"t_best_{'success' if t_best_success else 'failure'}", row)
             add_group(groups, f"region_{generation_region}", row)
             add_group(groups, f"final_{'success' if t_final_success else 'failure'}", row)
             if len(rows) % args.progress_interval == 0:
-                print(f"audited triggered pairs {len(rows)}, scanned {pair_idx + 1}/{num_pairs}")
+                print(f"audited pairs {len(rows)}, triggered {len(triggered_rows)}, scanned {pair_idx + 1}/{num_pairs}")
 
     csv_path = output_dir / "round2_generation_audit_pairs.csv"
     fieldnames = sorted({key for row in rows for key in row.keys()})
@@ -472,11 +567,24 @@ def evaluate(args):
             writer.writeheader()
             writer.writerows(rows)
 
+    candidate_csv_path = output_dir / "r2_candidate_poses.csv"
+    candidate_fields = [
+        "pair_id", "pair_index", "scene", "src_fragment", "tgt_fragment", "round2_mode",
+        "seed_id", "seed_src_index", "seed_tgt_index", "S2", "S2_sum",
+        "correspondence_count", "model_inlier_count", "valid_pose", "RE", "TE",
+        "candidate_trans_json",
+    ]
+    with open(candidate_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=candidate_fields)
+        writer.writeheader()
+        writer.writerows(candidate_rows)
+
     aggregate = {
         "num_pairs_scanned": num_pairs,
-        "triggered_pairs": len(rows),
+        "pairs_logged": len(rows),
+        "triggered_pairs": len(triggered_rows),
         "top_percentile": args.top_percentile,
-        "overall": aggregate_rows(rows),
+        "overall": aggregate_rows(triggered_rows),
         "groups": {key: aggregate_rows(value) for key, value in sorted(groups.items())},
         "split_definitions": {
             "t_best_success": f"RE < {config.re_thre} and TE < {config.te_thre} cm for refined T_best.",
@@ -485,6 +593,8 @@ def evaluate(args):
         },
         "config": args.config_path,
         "csv": str(csv_path),
+        "r2_candidate_csv": str(candidate_csv_path),
+        "r2_candidate_rows": len(candidate_rows),
     }
     with open(output_dir / "round2_generation_audit_metrics.json", "w", encoding="utf-8") as f:
         json.dump(aggregate, f, indent=2)

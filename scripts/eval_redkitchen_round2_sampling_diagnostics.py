@@ -58,7 +58,6 @@ def evaluate(args):
     from initial_matching_plus import Matcher_plus
     from test_3DLoMatch import (
         active_param,
-        attach_guided_candidate_pools,
         build_guided_prior,
         generate_r1_topk_transforms,
         sample_correspondences,
@@ -202,15 +201,20 @@ def evaluate(args):
             if not enter_round2:
                 continue
 
-            guide = attach_guided_candidate_pools(guide, src_keypts, tgt_keypts, config)
             r2_seed_src, r2_seed_tgt = sample_guided_seed_correspondences(
                 src_keypts,
                 tgt_keypts,
                 src_features,
                 tgt_features,
+                r1_src_corr,
+                r1_tgt_corr,
                 guide,
                 active_param(config, "active_round2_sampling"),
             )
+            guide["local_radius"] = active_param(config, "active_round2_local_radius")
+            guide["local_max_points"] = active_param(config, "active_round2_local_max_points")
+            guide["generalized_mutual_k"] = active_param(config, "active_round2_mutual_k")
+            guide["max_matches_per_seed"] = active_param(config, "active_round2_knn")
             r2_src_corr, r2_tgt_corr, r2_trans = regenerator.regenerate(
                 r2_seed_src,
                 r2_seed_tgt,
@@ -221,11 +225,12 @@ def evaluate(args):
                 gt_trans,
                 knn_num=active_param(config, "active_round2_knn"),
                 sampling_num=active_param(config, "active_round2_sampling"),
+                knn_radius=active_param(config, "active_round2_local_radius"),
                 guide=guide,
                 mode="guided_global",
             )
 
-            selected = guide["source_candidate_indices"].long()
+            selected = torch.cdist(r2_seed_src[0], src_keypts[0]).argmin(dim=1)
             best = guide["o_best"][selected] > 0
             broad = guide["o_broad"][selected] > 0
             reset = guide["o_reset"][selected] > active_param(config, "active_eps")

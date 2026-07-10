@@ -43,6 +43,7 @@ class Regenerator():
         self.eta_l = eta_l
         self.prior_eps = prior_eps
         self.sampling_num = 0
+        self.last_r2_candidates = []
         self.DEBUG = False
 
     def knn_search(self, x, y, k, ignore_self=False, normalized=True):
@@ -427,58 +428,133 @@ class Regenerator():
         adjusted = -guided_score
         return torch.nan_to_num(adjusted, nan=1e6, posinf=1e6, neginf=-1e6)
 
-    def guided_global_matching(self, src_point, tgt_point, src_feature, tgt_feature, guide, sampling_num):
-        eps = guide.get('eps', self.prior_eps)
-        prior_lambda = guide.get('lambda', self.prior_lambda)
-        eta_l = guide.get('eta_l', self.eta_l)
-        chunk_size = guide.get('chunk_size', 512)
+    def generalized_mutual_mask(self, distance, top_k):
+        src_count = distance.shape[1]
+        tgt_count = distance.shape[2]
+        src_k = min(max(int(top_k), 1), tgt_count)
+        tgt_k = min(max(int(top_k), 1), src_count)
 
-        source_indices = guide.get('source_candidate_indices')
-        target_indices = guide.get('target_candidate_indices')
-        if source_indices is None:
-            source_score = guide['source_prior'] * guide['source_under_support']
-            source_indices = torch.topk(source_score, k=min(sampling_num, source_score.shape[0]), largest=True).indices
-        if target_indices is None:
-            target_score = guide['target_under_support']
-            target_indices = torch.topk(target_score, k=min(tgt_point.shape[1], max(sampling_num, 1)), largest=True).indices
+        src_topk = distance.topk(k=src_k, dim=2, largest=False).indices
+        src_topk_mask = torch.zeros_like(distance, dtype=torch.bool)
+        src_topk_mask.scatter_(2, src_topk, True)
+        src_top1_mask = torch.zeros_like(distance, dtype=torch.bool)
+        src_top1_mask.scatter_(2, src_topk[:, :, :1], True)
 
-        src_pts = src_point[0, source_indices]
-        tgt_pts = tgt_point[0, target_indices]
-        src_desc = src_feature[0, source_indices]
-        tgt_desc = tgt_feature[0, target_indices]
+        tgt_topk = distance.topk(k=tgt_k, dim=1, largest=False).indices
+        tgt_topk_mask = torch.zeros_like(distance, dtype=torch.bool)
+        tgt_topk_mask.scatter_(1, tgt_topk, True)
+        tgt_top1_mask = torch.zeros_like(distance, dtype=torch.bool)
+        tgt_top1_mask.scatter_(1, tgt_topk[:, :1, :], True)
 
-        source_prior = guide['source_prior'][source_indices].clamp(eps, 1.0)
-        source_under = guide['source_under_support'][source_indices].clamp(eps, 1.0)
-        target_under = guide['target_under_support'][target_indices].clamp(eps, 1.0)
-        c_ref = guide['c_ref']
-        r_src = guide['r_src']
-        lever_d = torch.norm(src_pts - c_ref.view(1, 3), dim=-1) / (r_src + eps)
-        lever = 1.0 + eta_l * lever_d.clamp(0.0, 1.0)
-        source_log_prior = torch.log(source_prior) + torch.log(source_under) + torch.log(torch.maximum(lever, torch.tensor(eps, device=lever.device, dtype=lever.dtype)))
-        target_log_prior = torch.log(target_under)
+        return (src_top1_mask & tgt_topk_mask) | (src_topk_mask & tgt_top1_mask)
 
-        best_tgt = []
-        best_scores = []
-        for start in range(0, src_desc.shape[0], chunk_size):
-            end = min(start + chunk_size, src_desc.shape[0])
-            distance = torch.sqrt(torch.clamp(2 - 2 * (src_desc[start:end] @ tgt_desc.T), min=1e-6))
-            guided_score = -distance + prior_lambda * (source_log_prior[start:end, None] + target_log_prior[None, :])
-            scores, local_idx = torch.max(guided_score, dim=1)
-            best_tgt.append(local_idx)
-            best_scores.append(scores)
-        best_tgt = torch.cat(best_tgt, dim=0)
-        best_scores = torch.cat(best_scores, dim=0)
+    def paired_local_matching(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, guide):
+        guide = guide or {}
+        radius = float(guide.get('local_radius', 0.8))
+        max_local_points = int(guide.get('local_max_points', self.max_points))
+        mutual_k = int(guide.get('generalized_mutual_k', 3))
+        max_matches = int(guide.get('max_matches_per_seed', self.max_points))
+        src_all = src_point[0]
+        tgt_all = tgt_point[0]
+        src_desc_all = src_feature[0]
+        tgt_desc_all = tgt_feature[0]
+        seed_count = min(src_key_corr.shape[1], tgt_key_corr.shape[1])
+        pair_scores = {}
+        candidate_records = []
+        if seed_count > 0:
+            src_center_distances = torch.cdist(src_key_corr[0, :seed_count], src_all)
+            tgt_center_distances = torch.cdist(tgt_key_corr[0, :seed_count], tgt_all)
+            src_local_count = min(max_local_points, src_all.shape[0])
+            tgt_local_count = min(max_local_points, tgt_all.shape[0])
+            src_distance, src_indices = torch.topk(src_center_distances, src_local_count, dim=1, largest=False)
+            tgt_distance, tgt_indices = torch.topk(tgt_center_distances, tgt_local_count, dim=1, largest=False)
+            src_valid = src_distance <= radius
+            tgt_valid = tgt_distance <= radius
+            src_desc = src_desc_all[src_indices]
+            tgt_desc = tgt_desc_all[tgt_indices]
+            distance = torch.sqrt(torch.clamp(2 - 2 * torch.matmul(src_desc, tgt_desc.transpose(1, 2)), min=1e-6))
+            distance = self.apply_guided_similarity(
+                distance,
+                src_all[src_indices],
+                tgt_all[tgt_indices],
+                src_indices,
+                tgt_indices,
+                guide
+            )
+            valid_pair = src_valid[:, :, None] & tgt_valid[:, None, :]
+            distance = distance.masked_fill(~valid_pair, 1e6)
+            mutual_mask = self.generalized_mutual_mask(distance, mutual_k) & valid_pair
+            for seed_index in range(seed_count):
+                matched = torch.where(mutual_mask[seed_index])
+                if matched[0].numel() == 0:
+                    continue
+                scores = -distance[seed_index][matched]
+                if scores.numel() > max_matches:
+                    keep = torch.topk(scores, max_matches, largest=True).indices
+                    matched = (matched[0][keep], matched[1][keep])
+                    scores = scores[keep]
+                candidate_src = src_all[src_indices[seed_index, matched[0]]]
+                candidate_tgt = tgt_all[tgt_indices[seed_index, matched[1]]]
+                candidate_record = {
+                    'seed_id': seed_index,
+                    'seed_src_index': int(src_center_distances[seed_index].argmin().item()),
+                    'seed_tgt_index': int(tgt_center_distances[seed_index].argmin().item()),
+                    's2': float(scores.mean().item()),
+                    's2_sum': float(scores.sum().item()),
+                    'correspondence_count': int(scores.numel()),
+                    'model_inlier_count': 0,
+                    'valid_pose': int(scores.numel() >= 3),
+                    'candidate_trans': None,
+                }
+                if scores.numel() >= 3:
+                    weights = torch.softmax(scores, dim=0) * scores.shape[0]
+                    candidate_trans = rigid_transform_3d(
+                        candidate_src[None],
+                        candidate_tgt[None],
+                        weights[None],
+                    ).detach().cpu()
+                    residual = torch.norm(
+                        transform(candidate_src[None], candidate_trans.to(candidate_src.device)) - candidate_tgt[None],
+                        dim=-1,
+                    )
+                    candidate_record['candidate_trans'] = candidate_trans
+                    candidate_record['model_inlier_count'] = int((residual < self.inlier_threshold).sum().item())
+                candidate_records.append(candidate_record)
+                for local_src, local_tgt, score in zip(matched[0].tolist(), matched[1].tolist(), scores.tolist()):
+                    key = (int(src_indices[seed_index, local_src]), int(tgt_indices[seed_index, local_tgt]))
+                    pair_scores[key] = max(pair_scores.get(key, -float('inf')), float(score))
 
-        src_corr = src_pts[None]
-        tgt_corr = tgt_pts[best_tgt][None]
-        self.last_match_weights = torch.softmax(best_scores, dim=0) * best_scores.shape[0]
-        if src_corr.shape[1] >= 10:
-            corr_idx = self.global_spatial_fitering_topk_two(src_corr, tgt_corr)
-            src_corr = src_corr[:, corr_idx, :]
-            tgt_corr = tgt_corr[:, corr_idx, :]
-            self.last_match_weights = self.last_match_weights[corr_idx]
-        final_tran = rigid_transform_3d(src_corr, tgt_corr, self.last_match_weights[None])
+        if not pair_scores:
+            self.last_r2_candidates = candidate_records
+            empty_src = src_point[:, :0, :]
+            empty_tgt = tgt_point[:, :0, :]
+            self.last_match_weights = torch.empty(0, dtype=src_point.dtype, device=src_point.device)
+            return empty_src, empty_tgt, torch.eye(4, dtype=src_point.dtype, device=src_point.device)[None]
+
+        pairs = sorted(pair_scores.items(), key=lambda item: item[1], reverse=True)
+        src_indices = torch.tensor([item[0][0] for item in pairs], dtype=torch.long, device=src_point.device)
+        tgt_indices = torch.tensor([item[0][1] for item in pairs], dtype=torch.long, device=tgt_point.device)
+        scores = torch.tensor([item[1] for item in pairs], dtype=src_point.dtype, device=src_point.device)
+        src_corr = src_all[src_indices][None]
+        tgt_corr = tgt_all[tgt_indices][None]
+        self.last_r2_candidates = candidate_records
+        self.last_match_weights = torch.softmax(scores, dim=0) * scores.shape[0]
+        if src_corr.shape[1] < 3:
+            final_tran = torch.eye(4, dtype=src_point.dtype, device=src_point.device)[None]
+        else:
+            final_tran = rigid_transform_3d(src_corr, tgt_corr, self.last_match_weights[None])
         return src_corr, tgt_corr, final_tran
+
+    def guided_global_matching(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, guide, sampling_num):
+        return self.paired_local_matching(
+            src_key_corr,
+            tgt_key_corr,
+            src_point,
+            tgt_point,
+            src_feature,
+            tgt_feature,
+            guide
+        )
 
 
     def idx_selection(self, idx, points):
@@ -616,8 +692,18 @@ class Regenerator():
         self.gt_trans = gt_trans
         self.use_sampling = use_sampling
         self.last_match_weights = None
-        if mode == "guided_global":
-            return self.guided_global_matching(src_point, tgt_point, src_feature, tgt_feature, guide, sampling_num)
+        self.last_r2_candidates = []
+        if mode in ("guided_global", "paired_local"):
+            return self.guided_global_matching(
+                src_key_corr,
+                tgt_key_corr,
+                src_point,
+                tgt_point,
+                src_feature,
+                tgt_feature,
+                guide,
+                sampling_num
+            )
         #################################
         # knn & regenerate correspondences
         #################################

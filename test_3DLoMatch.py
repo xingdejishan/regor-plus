@@ -93,8 +93,15 @@ ACTIVE_REQUIRED_KEYS = (
     'active_fsv_trunc_margin',
     'active_fsv_stride',
     'active_fsv_max_frames',
-    'active_round2_target_pool',
-    'active_feature_chunk_size',
+    'active_round2_local_radius',
+    'active_round2_local_max_points',
+    'active_round2_mutual_k',
+    'active_round2_explore_fraction',
+    'active_round2_explore_exclude_radius',
+    'active_round2_explore_topk',
+    'active_round2_explore_min_compatibility',
+    'active_round2_seed_diversity_radius',
+    'active_round2_explore_geometry_chunk_size',
     'active_eps',
 )
 
@@ -130,6 +137,23 @@ def validate_active_config(config):
     for key in ('active_support_target_radius', 'active_support_r1_radius', 'active_support_local_radius'):
         if getattr(config, key) <= 0:
             raise ValueError(f"{key} must be > 0.")
+    if config.active_round2_local_radius <= 0:
+        raise ValueError("active_round2_local_radius must be > 0.")
+    if int(config.active_round2_local_max_points) < 1:
+        raise ValueError("active_round2_local_max_points must be >= 1.")
+    if int(config.active_round2_mutual_k) < 1:
+        raise ValueError("active_round2_mutual_k must be >= 1.")
+    if not 0.0 <= float(config.active_round2_explore_fraction) <= 1.0:
+        raise ValueError("active_round2_explore_fraction must be in [0, 1].")
+    for key in ('active_round2_explore_exclude_radius', 'active_round2_seed_diversity_radius'):
+        if getattr(config, key) <= 0:
+            raise ValueError(f"{key} must be > 0.")
+    if int(config.active_round2_explore_topk) < 1:
+        raise ValueError("active_round2_explore_topk must be >= 1.")
+    if int(config.active_round2_explore_min_compatibility) < 1:
+        raise ValueError("active_round2_explore_min_compatibility must be >= 1.")
+    if int(config.active_round2_explore_geometry_chunk_size) < 1:
+        raise ValueError("active_round2_explore_geometry_chunk_size must be >= 1.")
     if int(config.active_support_min_neighbors) < 1:
         raise ValueError("active_support_min_neighbors must be >= 1.")
     for key in ('active_support_r1_weight', 'active_support_local_weight'):
@@ -339,6 +363,8 @@ def build_guided_prior(src_points, tgt_points, src_overlap, tgt_overlap, r1_src,
         'source_prior': source_prior,
         'source_under_support': source_under,
         'target_under_support': target_under,
+        'local_prior': local_prior,
+        'global_matchable': global_matchable,
         'o_best': o_best,
         'o_broad': o_broad,
         'o_reset': o_reset,
@@ -347,6 +373,13 @@ def build_guided_prior(src_points, tgt_points, src_overlap, tgt_overlap, r1_src,
         'lambda': active_param(config, 'active_prior_lambda'),
         'eta_l': active_param(config, 'active_eta_l') if active_param(config, 'use_adaptive_leverage') else 0.0,
         'eps': eps,
+        'explore_fraction': active_param(config, 'active_round2_explore_fraction'),
+        'explore_exclude_radius': active_param(config, 'active_round2_explore_exclude_radius'),
+        'explore_topk': active_param(config, 'active_round2_explore_topk'),
+        'explore_min_compatibility': active_param(config, 'active_round2_explore_min_compatibility'),
+        'seed_diversity_radius': active_param(config, 'active_round2_seed_diversity_radius'),
+        'explore_geometry_chunk_size': active_param(config, 'active_round2_explore_geometry_chunk_size'),
+        'd_thre': cfg_get(config, 'd_thre', cfg_get(config, 'inlier_threshold', 0.1)),
     }
     diagnostics = {
         'fsv_value': fsv_value,
@@ -428,52 +461,222 @@ def select_best_r1_transform(src_corr, tgt_corr, topk_trans, config):
     return best_trans, torch.stack(refined_transforms, dim=1), best_inliers
 
 
-def sample_guided_seed_correspondences(src_keypts, tgt_keypts, src_features, tgt_features, guide, sample_num):
+def spatial_diverse_topk(points, scores, count, radius):
+    count = min(max(int(count), 0), points.shape[0])
+    if count == 0 or points.shape[0] == 0:
+        return torch.empty(0, dtype=torch.long, device=points.device)
+    scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    if float(scores.max()) <= 0.0:
+        return torch.empty(0, dtype=torch.long, device=points.device)
+    available = torch.ones(points.shape[0], dtype=torch.bool, device=points.device)
+    selected = []
+    for _ in range(count):
+        masked_scores = scores.masked_fill(~available, -torch.inf)
+        index = int(torch.argmax(masked_scores).item())
+        if not available[index] or not torch.isfinite(masked_scores[index]):
+            break
+        selected.append(index)
+        available[index] = False
+        if radius > 0:
+            distance = torch.norm(points - points[index].view(1, 3), dim=1)
+            available &= distance > radius
+    if len(selected) < count:
+        remaining = torch.argsort(scores, descending=True)
+        selected_set = set(selected)
+        for index in remaining.tolist():
+            if float(scores[index]) <= 0.0:
+                break
+            if index not in selected_set:
+                selected.append(index)
+                selected_set.add(index)
+            if len(selected) >= count:
+                break
+    return torch.tensor(selected, dtype=torch.long, device=points.device)
+
+
+def bidirectional_topk_match(src_features, tgt_features, src_indices, k):
+    if src_indices.numel() == 0 or tgt_features.shape[0] == 0:
+        return (
+            torch.empty((0, 2), dtype=torch.long, device=src_features.device),
+            torch.empty(0, dtype=src_features.dtype, device=src_features.device),
+        )
+    distance = torch.sqrt(torch.clamp(2 - 2 * (src_features @ tgt_features.T), min=1e-6))
+    src_k = min(max(int(k), 1), tgt_features.shape[0])
+    tgt_k = min(max(int(k), 1), src_features.shape[0])
+    src_to_tgt = distance.topk(src_k, dim=1, largest=False).indices
+    tgt_to_src = distance.topk(tgt_k, dim=0, largest=False).indices
+    pair_map = {}
+    for src_local in range(src_features.shape[0]):
+        for tgt_local in src_to_tgt[src_local].tolist():
+            key = (int(src_indices[src_local]), int(tgt_local))
+            pair_map[key] = min(pair_map.get(key, float('inf')), float(distance[src_local, tgt_local]))
+    for tgt_local in range(tgt_features.shape[0]):
+        for src_local in tgt_to_src[:, tgt_local].tolist():
+            key = (int(src_indices[src_local]), int(tgt_local))
+            pair_map[key] = min(pair_map.get(key, float('inf')), float(distance[src_local, tgt_local]))
+    pairs = sorted(pair_map.items(), key=lambda item: item[1])
+    pair_indices = torch.tensor([item[0] for item in pairs], dtype=torch.long, device=src_features.device)
+    pair_scores = -torch.tensor([item[1] for item in pairs], dtype=src_features.dtype, device=src_features.device)
+    return pair_indices, pair_scores
+
+
+def geometric_compatibility_filter(candidate_pairs, candidate_scores, src_points, tgt_points, threshold, min_compatibility, desired_count=0, chunk_size=256):
+    if candidate_pairs.shape[0] == 0:
+        return candidate_pairs, candidate_scores, False
+    src_candidate = src_points[candidate_pairs[:, 0]]
+    tgt_candidate = tgt_points[candidate_pairs[:, 1]]
+    compatibility_chunks = []
+    for start in range(0, candidate_pairs.shape[0], int(chunk_size)):
+        end = min(start + int(chunk_size), candidate_pairs.shape[0])
+        src_distance = torch.cdist(src_candidate[start:end], src_candidate)
+        tgt_distance = torch.cdist(tgt_candidate[start:end], tgt_candidate)
+        compatibility_chunks.append((torch.abs(src_distance - tgt_distance) <= threshold).sum(dim=1) - 1)
+    compatibility = torch.cat(compatibility_chunks, dim=0)
+    keep = compatibility >= int(min_compatibility)
+    fallback_used = False
+    if int(keep.sum().item()) < int(desired_count):
+        fallback_used = True
+        fallback_count = min(int(desired_count), candidate_pairs.shape[0])
+        keep_indices = torch.topk(compatibility, k=fallback_count, largest=True).indices
+        keep = torch.zeros_like(keep)
+        keep[keep_indices] = True
+    if not torch.any(keep):
+        return candidate_pairs[:0], candidate_scores[:0], fallback_used
+    filtered_scores = candidate_scores[keep] + compatibility[keep].to(candidate_scores.dtype) * 1e-3
+    return candidate_pairs[keep], filtered_scores, fallback_used
+
+
+def spatial_diverse_pair_select(candidate_pairs, candidate_scores, src_points, tgt_points, count, radius):
+    count = min(max(int(count), 0), candidate_pairs.shape[0])
+    if count == 0:
+        return candidate_pairs[:0]
+    order = torch.argsort(candidate_scores, descending=True)
+    available = torch.ones(candidate_pairs.shape[0], dtype=torch.bool, device=candidate_pairs.device)
+    selected = []
+    for _ in range(count):
+        available_order = order[available[order]]
+        if available_order.numel() == 0:
+            break
+        pair_index = int(available_order[0].item())
+        selected.append(pair_index)
+        available[pair_index] = False
+        src_distance = torch.norm(src_points[candidate_pairs[:, 0]] - src_points[candidate_pairs[pair_index, 0]], dim=1)
+        tgt_distance = torch.norm(tgt_points[candidate_pairs[:, 1]] - tgt_points[candidate_pairs[pair_index, 1]], dim=1)
+        available &= (src_distance > radius) & (tgt_distance > radius)
+    if len(selected) < count:
+        for pair_index in order.tolist():
+            if pair_index not in selected:
+                selected.append(pair_index)
+            if len(selected) >= count:
+                break
+    return candidate_pairs[torch.tensor(selected, dtype=torch.long, device=candidate_pairs.device)]
+
+
+def exploit_seed_pairs(src_points, r1_src, r1_tgt, exploit_idx, exploit_score, count, radius):
+    if count == 0 or r1_src.shape[0] == 0 or exploit_idx.numel() == 0:
+        return r1_src[:0], r1_tgt[:0]
+    selected_r1 = []
+    used_r1 = set()
+    for source_index in exploit_idx.tolist():
+        r1_index = int(torch.norm(r1_src - src_points[source_index].view(1, 3), dim=1).argmin().item())
+        if r1_index not in used_r1:
+            selected_r1.append(r1_index)
+            used_r1.add(r1_index)
+        if len(selected_r1) >= count:
+            break
+    if len(selected_r1) < count:
+        r1_source_score = torch.zeros(r1_src.shape[0], dtype=exploit_score.dtype, device=exploit_score.device)
+        nearest = torch.cdist(r1_src, src_points).argmin(dim=1)
+        r1_source_score = exploit_score[nearest]
+        r1_idx = spatial_diverse_topk(r1_src, r1_source_score, count, radius)
+        for index in r1_idx.tolist():
+            if index not in used_r1:
+                selected_r1.append(index)
+            if len(selected_r1) >= count:
+                break
+    if len(selected_r1) < count:
+        r1_source_score = torch.zeros(r1_src.shape[0], dtype=exploit_score.dtype, device=exploit_score.device)
+        nearest = torch.cdist(r1_src, src_points).argmin(dim=1)
+        r1_source_score = exploit_score[nearest]
+        r1_order = torch.argsort(r1_source_score, descending=True).tolist()
+        cursor = 0
+        while len(selected_r1) < count:
+            selected_r1.append(r1_order[cursor % len(r1_order)])
+            cursor += 1
+    selected_r1 = torch.tensor(selected_r1[:count], dtype=torch.long, device=r1_src.device)
+    return r1_src[selected_r1], r1_tgt[selected_r1]
+
+
+def sample_guided_seed_correspondences(src_keypts, tgt_keypts, src_features, tgt_features, r1_src_corr, r1_tgt_corr, guide, sample_num):
     src_points = src_keypts[0]
     tgt_points = tgt_keypts[0]
-    src_desc = src_features[0]
-    tgt_desc = tgt_features[0]
-    eps = guide.get('eps', 1e-4)
-    prior_lambda = guide.get('lambda', 0.1)
+    r1_src = r1_src_corr[0]
+    r1_tgt = r1_tgt_corr[0]
+    if r1_src.shape[0] != r1_tgt.shape[0]:
+        raise ValueError('Round1 source/target correspondence counts must match.')
+    if r1_src.shape[0] == 0:
+        return r1_src_corr, r1_tgt_corr
 
-    src_score = guide['source_prior'] * guide['source_under_support']
-    src_score = torch.nan_to_num(src_score, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-    if float(src_score.sum()) <= 0:
-        src_score = torch.ones_like(src_score)
-    sample_num = min(sample_num, src_points.shape[0])
-    src_idx = torch.topk(src_score, k=sample_num, largest=True).indices
+    explore_fraction = float(guide['explore_fraction'])
+    num_explore = int(round(sample_num * explore_fraction))
+    num_exploit = sample_num - num_explore
+    seed_radius = float(guide['seed_diversity_radius'])
+    exploit_score = guide['local_prior'] * guide['source_under_support']
+    exploit_idx = spatial_diverse_topk(src_points, exploit_score, num_exploit, seed_radius)
+    exploit_src, exploit_tgt = exploit_seed_pairs(
+        src_points,
+        r1_src,
+        r1_tgt,
+        exploit_idx,
+        exploit_score,
+        num_exploit,
+        seed_radius,
+    )
 
-    distance = torch.sqrt(torch.clamp(2 - 2 * (src_desc[src_idx] @ tgt_desc.T), min=1e-6))
-    tgt_under = guide['target_under_support'].clamp(eps, 1.0)
-    c_ref = guide['c_ref']
-    r_src = guide['r_src']
-    eta_l = guide.get('eta_l', 0.0)
-    lever_d = torch.norm(src_points[src_idx] - c_ref.view(1, 3), dim=-1) / (r_src + eps)
-    lever = 1.0 + eta_l * lever_d.clamp(0.0, 1.0)
-    source_log_prior = torch.log(guide['source_prior'][src_idx].clamp(eps, 1.0)) + torch.log(guide['source_under_support'][src_idx].clamp(eps, 1.0)) + torch.log(torch.maximum(lever, torch.tensor(eps, device=lever.device, dtype=lever.dtype)))
-    target_log_prior = torch.log(tgt_under)
-    distance = distance - prior_lambda * (source_log_prior[:, None] + target_log_prior[None, :])
-    tgt_idx = torch.argmin(distance, dim=1)
-
-    return src_points[src_idx][None], tgt_points[tgt_idx][None]
-
-
-def attach_guided_candidate_pools(guide, src_keypts, tgt_keypts, config):
-    source_score = guide['source_prior'] * guide['source_under_support']
-    source_score = torch.nan_to_num(source_score, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-    if float(source_score.sum()) <= 0:
-        source_score = torch.ones_like(source_score)
-    source_k = min(active_param(config, 'active_round2_sampling'), src_keypts.shape[1])
-    guide['source_candidate_indices'] = torch.topk(source_score, k=source_k, largest=True).indices
-
-    target_score = guide['target_under_support']
-    target_score = torch.nan_to_num(target_score, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-    if float(target_score.sum()) <= 0:
-        target_score = torch.ones_like(target_score)
-    target_k = min(active_param(config, 'active_round2_target_pool'), tgt_keypts.shape[1])
-    guide['target_candidate_indices'] = torch.topk(target_score, k=target_k, largest=True).indices
-    guide['chunk_size'] = active_param(config, 'active_feature_chunk_size')
-    return guide
+    best_mask = guide['o_best'] > 0
+    if torch.any(best_mask):
+        best_distance = min_dist_to_points(src_points, src_points[best_mask])
+        novel_mask = (best_distance > float(guide['explore_exclude_radius'])).float()
+    else:
+        novel_mask = torch.ones(src_points.shape[0], dtype=src_points.dtype, device=src_points.device)
+    explore_score = guide['global_matchable'] * novel_mask
+    explore_idx = spatial_diverse_topk(src_points, explore_score, num_explore, seed_radius)
+    candidate_pairs, candidate_scores = bidirectional_topk_match(
+        src_features[0, explore_idx],
+        tgt_features[0],
+        explore_idx,
+        guide['explore_topk'],
+    )
+    candidate_pairs, candidate_scores, compatibility_fallback = geometric_compatibility_filter(
+        candidate_pairs,
+        candidate_scores,
+        src_points,
+        tgt_points,
+        guide['d_thre'],
+        guide['explore_min_compatibility'],
+        num_explore,
+        guide['explore_geometry_chunk_size'],
+    )
+    explore_pairs = spatial_diverse_pair_select(
+        candidate_pairs,
+        candidate_scores,
+        src_points,
+        tgt_points,
+        num_explore,
+        seed_radius,
+    )
+    if explore_pairs.shape[0] > 0:
+        explore_src = src_points[explore_pairs[:, 0]]
+        explore_tgt = tgt_points[explore_pairs[:, 1]]
+    else:
+        explore_src = src_points[:0]
+        explore_tgt = tgt_points[:0]
+    guide['round2_num_exploit'] = num_exploit
+    guide['round2_num_explore'] = num_explore
+    guide['round2_exploit_seed_count'] = int(exploit_src.shape[0])
+    guide['round2_explore_seed_count'] = int(explore_src.shape[0])
+    guide['round2_explore_compatibility_fallback'] = bool(compatibility_fallback)
+    return torch.cat([exploit_src, explore_src], dim=0)[None], torch.cat([exploit_tgt, explore_tgt], dim=0)[None]
 
 
 def sample_random_uniform_seed_correspondences(src_keypts, tgt_keypts, sample_num):
@@ -706,29 +909,41 @@ def eval_3DLoMatch_scene(loader, matcher, regenerator, estimator, trans_evaluato
 
             if enter_round2:
                 regenerate_mode = "local"
-                regenerate_guide = None
+                regenerate_guide = {
+                    'local_radius': active_param(config, 'active_round2_local_radius'),
+                    'local_max_points': active_param(config, 'active_round2_local_max_points'),
+                    'generalized_mutual_k': active_param(config, 'active_round2_mutual_k'),
+                    'max_matches_per_seed': active_param(config, 'active_round2_knn'),
+                }
                 if round2_mode == 'original':
                     r2_seed_src, r2_seed_tgt = sample_correspondences(
-                        seed_src_corr,
-                        seed_tgt_corr,
+                        r1_src_corr,
+                        r1_tgt_corr,
                         active_param(config, 'active_round2_sampling')
                     )
+                    regenerate_mode = "paired_local"
                 elif round2_mode == 'random_uniform':
                     r2_seed_src, r2_seed_tgt = sample_random_uniform_seed_correspondences(
                         src_keypts,
                         tgt_keypts,
                         active_param(config, 'active_round2_sampling')
                     )
+                    regenerate_mode = "paired_local"
                 elif round2_mode == 'weakness_guided':
-                    guide = attach_guided_candidate_pools(guide, src_keypts, tgt_keypts, config)
                     r2_seed_src, r2_seed_tgt = sample_guided_seed_correspondences(
                         src_keypts,
                         tgt_keypts,
                         src_features,
                         tgt_features,
+                        r1_src_corr,
+                        r1_tgt_corr,
                         guide,
                         active_param(config, 'active_round2_sampling')
                     )
+                    guide['local_radius'] = active_param(config, 'active_round2_local_radius')
+                    guide['local_max_points'] = active_param(config, 'active_round2_local_max_points')
+                    guide['generalized_mutual_k'] = active_param(config, 'active_round2_mutual_k')
+                    guide['max_matches_per_seed'] = active_param(config, 'active_round2_knn')
                     regenerate_mode = "guided_global"
                     regenerate_guide = guide
                 else:
@@ -743,12 +958,14 @@ def eval_3DLoMatch_scene(loader, matcher, regenerator, estimator, trans_evaluato
                     gt_trans,
                     knn_num=active_param(config, 'active_round2_knn'),
                     sampling_num=active_param(config, 'active_round2_sampling'),
+                    knn_radius=active_param(config, 'active_round2_local_radius'),
                     guide=regenerate_guide,
                     mode=regenerate_mode
                 )
                 src_keypts_corr_final = torch.cat([r1_src_corr, r2_src_corr], dim=1)
                 tgt_keypts_corr_final = torch.cat([r1_tgt_corr, r2_tgt_corr], dim=1)
-                pred_trans = r2_trans
+                if r2_src_corr.shape[1] >= 3:
+                    pred_trans = r2_trans
                 if regenerator.last_match_weights is not None and regenerator.last_match_weights.shape[0] == r2_src_corr.shape[1]:
                     r2_match_weights = regenerator.last_match_weights.to(device=r1_src_corr.device, dtype=r1_src_corr.dtype)
                 else:
@@ -945,6 +1162,9 @@ def eval_3DLoMatch_single(config):
         "\tActive params: "
         f"round2_mode={config.round2_mode}, "
         f"lambda_prior={config.active_prior_lambda}, eta_L={config.active_eta_l}, gamma_reset={config.active_reset_gamma}, "
+        f"explore_fraction={config.active_round2_explore_fraction}, explore_exclude_radius={config.active_round2_explore_exclude_radius}, "
+        f"explore_topk={config.active_round2_explore_topk}, explore_min_compatibility={config.active_round2_explore_min_compatibility}, "
+        f"seed_diversity_radius={config.active_round2_seed_diversity_radius}, geometry_chunk_size={config.active_round2_explore_geometry_chunk_size}, "
         f"alpha={config.active_alpha}, tau_fsv={config.active_tau_fsv}, tau_rho={config.active_tau_rho}, "
         f"tau_overlap={config.active_overlap_threshold}, n_min={config.active_density_min}, "
         f"n_max={config.active_balance_max}, K_top={config.active_reset_topk}, "
