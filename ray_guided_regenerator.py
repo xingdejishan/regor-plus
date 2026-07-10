@@ -33,6 +33,20 @@ class PoseHypothesis:
     insufficient_evidence: bool = False
     rejected_by_history: bool = False
     ray_signature: object | None = None
+    geometry_rmse: float = float("inf")
+    refinement_attempted: bool = False
+    entered_refinement_pool: bool = False
+    refinement_child_id: int = -1
+    refinement_accepted: bool | None = None
+    refinement_reject_reason: str = ""
+    rotation_delta_deg: float = float("nan")
+    translation_delta_m: float = float("nan")
+    parent_validation_score: float = float("inf")
+    child_validation_score: float = float("inf")
+    parent_free_violation: float = float("inf")
+    child_free_violation: float = float("inf")
+    parent_geometry_rmse: float = float("inf")
+    child_geometry_rmse: float = float("inf")
 
     @property
     def pose(self):
@@ -62,11 +76,12 @@ class DescriptorCache:
 
 
 class RayGuidedRegenerator:
-    def __init__(self, descriptor_topk, local_corr_max_points, local_knn_radius, local_mutual_k, escape_lambda, independent_explore_fraction, local_regenerator=None, seed_group_count=None):
+    def __init__(self, descriptor_topk, local_corr_max_points, local_knn_radius, local_mutual_k, escape_lambda, independent_explore_fraction, local_regenerator=None, seed_group_count=None, refine_corr_radius=0.15):
         self.descriptor_topk = int(descriptor_topk)
         self.local_corr_max_points = int(local_corr_max_points)
         self.local_knn_radius = float(local_knn_radius)
         self.local_mutual_k = int(local_mutual_k)
+        self.refine_corr_radius = float(refine_corr_radius)
         self.escape_lambda = float(escape_lambda)
         self.independent_explore_fraction = float(independent_explore_fraction)
         self.local_regenerator = local_regenerator
@@ -160,25 +175,35 @@ class RayGuidedRegenerator:
                 break
         return groups
 
-    def _local_refine(self, seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features):
-        raw = rigid_transform_3d(seed_src, seed_tgt)
-        if self.local_regenerator is None:
-            return seed_src, seed_tgt, raw
+    def _local_refine(self, parent, src_points, tgt_points, src_features, tgt_features):
+        src = src_points[0] if src_points.ndim == 3 else src_points
+        tgt = tgt_points[0] if tgt_points.ndim == 3 else tgt_points
+        seed_src = src[parent.seed_ids[:, 0]][None]
+        seed_tgt = tgt[parent.seed_ids[:, 1]][None]
+        corr_src, corr_tgt = seed_src, seed_tgt
         guide = {
             "local_radius": self.local_knn_radius,
             "local_max_points": self.local_corr_max_points,
             "generalized_mutual_k": self.local_mutual_k,
             "max_matches_per_seed": self.local_corr_max_points,
         }
-        try:
-            refined_src, refined_tgt, refined = self.local_regenerator.regenerate_seed_group(
-                seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features, guide,
-            )
-        except (RuntimeError, ValueError):
-            return seed_src, seed_tgt, raw
-        if refined_src.shape[1] < 3:
-            return seed_src, seed_tgt, raw
-        return refined_src, refined_tgt, refined
+        if self.local_regenerator is not None:
+            try:
+                corr_src, corr_tgt, _ = self.local_regenerator.regenerate_seed_group(
+                    seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features, guide,
+                )
+            except (RuntimeError, ValueError):
+                pass
+        if corr_src.shape[1] < 3:
+            return None
+        raw_pose = parent.pose_raw[0] if parent.pose_raw.ndim == 3 else parent.pose_raw
+        src_warped = corr_src @ raw_pose[:3, :3].transpose(0, 1) + raw_pose[:3, 3]
+        residuals = torch.linalg.norm(src_warped - corr_tgt, dim=-1)
+        keep = residuals[0] < self.refine_corr_radius
+        if int(keep.sum().item()) < 3:
+            return None
+        corr_src, corr_tgt = corr_src[:, keep], corr_tgt[:, keep]
+        return corr_src, corr_tgt, rigid_transform_3d(corr_src, corr_tgt)
 
     def _explicit_seed_groups(self, seed_src, seed_tgt, src_points, tgt_points):
         if seed_src is None or seed_tgt is None:
@@ -195,16 +220,25 @@ class RayGuidedRegenerator:
                 groups.append(group)
         return groups
 
-    def refine_hypothesis(self, hypothesis, src_points, tgt_points, src_features, tgt_features):
-        src = src_points[0] if src_points.ndim == 3 else src_points
-        tgt = tgt_points[0] if tgt_points.ndim == 3 else tgt_points
-        seed_src = src[hypothesis.seed_ids[:, 0]][None]
-        seed_tgt = tgt[hypothesis.seed_ids[:, 1]][None]
-        corr_src, corr_tgt, refined_pose = self._local_refine(seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features)
-        hypothesis.src_corr = corr_src
-        hypothesis.tgt_corr = corr_tgt
-        hypothesis.pose_local_refined = refined_pose
-        return hypothesis
+    def refine_hypothesis(self, parent, src_points, tgt_points, src_features, tgt_features):
+        refined = self._local_refine(parent, src_points, tgt_points, src_features, tgt_features)
+        if refined is None:
+            return None
+        corr_src, corr_tgt, refined_pose = refined
+        return PoseHypothesis(
+            hypothesis_id=-1,
+            parent_id=parent.hypothesis_id,
+            round_id=parent.round_id,
+            pose_raw=parent.pose_raw.detach().clone(),
+            pose_local_refined=refined_pose,
+            src_corr=corr_src,
+            tgt_corr=corr_tgt,
+            correspondence_scores=torch.ones(corr_src.shape[1], device=corr_src.device, dtype=corr_src.dtype),
+            seed_ids=parent.seed_ids.detach().clone(),
+            generation_mode=f"{parent.generation_mode}_refined",
+            descriptor_score=parent.descriptor_score,
+            predicted_escape_score=parent.predicted_escape_score,
+        )
 
     def generate_hypotheses(self, seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features, constraints, candidate_count, round_id, parent_id):
         if seed_src is not None and seed_tgt is not None:

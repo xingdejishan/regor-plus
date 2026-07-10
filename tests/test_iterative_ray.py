@@ -112,15 +112,74 @@ class IterativeRayTests(unittest.TestCase):
         self.assertTrue(any(item.generation_mode == "r1" for item in result.archive.hypotheses))
         self.assertIsNotNone(result.archive.incumbent)
 
-    def test_raw_archive_records_candidates_before_filtering(self):
+    def test_post_refine_archive_contains_all_raw_candidates(self):
         src, tgt, pose, features = points()
         result = search().run(pose, {"src_points": src, "tgt_points": tgt, "src_features": features, "tgt_features": features, "source_rays": bundle(), "target_rays": bundle()})
         generated = sum(row["generated_candidate_count"] for row in result.round_logs)
         self.assertEqual(len(result.raw_archive.hypotheses), generated + 1)
         self.assertEqual(len(result.raw_candidate_logs), len(result.raw_archive.hypotheses))
-        self.assertGreaterEqual(len(result.raw_archive.hypotheses), len(result.archive.hypotheses))
+        self.assertGreaterEqual(len(result.post_refinement_archive.hypotheses), len(result.raw_archive.hypotheses))
         self.assertIs(result.refined_archive, result.archive)
-        self.assertIsNot(result.raw_archive.hypotheses[0], result.archive.hypotheses[0])
+        self.assertIsNot(result.raw_archive.hypotheses[0], result.post_refinement_archive.hypotheses[0])
+        self.assertTrue({item.hypothesis_id for item in result.raw_archive.hypotheses}.issubset({item.hypothesis_id for item in result.post_refinement_archive.hypotheses}))
+        self.assertEqual(len({item.hypothesis_id for item in result.post_refinement_archive.hypotheses}), len(result.post_refinement_archive.hypotheses))
+        self.assertTrue(all(not torch.isinf(torch.tensor(item.validation_ray_score)) for item in result.raw_archive.hypotheses))
+
+    def test_refinement_does_not_mutate_raw_parent(self):
+        src, tgt, pose, features = points()
+        parent = PoseHypothesis(
+            1,
+            0,
+            1,
+            pose.clone(),
+            pose.clone(),
+            src[:, :3].clone(),
+            tgt[:, :3].clone(),
+            torch.ones(3),
+            torch.tensor([[0, 0], [1, 1], [2, 2]], dtype=torch.long),
+            "ray_guided",
+        )
+        pose_before, corr_before = parent.pose.clone(), parent.src_corr.clone()
+        child = RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 0.2).refine_hypothesis(parent, src, tgt, features, features)
+        self.assertIsNotNone(child)
+        self.assertTrue(torch.allclose(parent.pose, pose_before))
+        self.assertTrue(torch.allclose(parent.pose_local_refined, parent.pose_raw))
+        self.assertTrue(torch.allclose(parent.src_corr, corr_before))
+        self.assertEqual(child.parent_id, parent.hypothesis_id)
+
+    def test_raw_candidate_survives_without_refinement_budget(self):
+        src, tgt, pose, features = points()
+        engine = search(max_rounds=1)
+        engine.config = IterativeRayConfig(**{**engine.config.report(), "candidates_per_round": 1, "candidate_pool_multiplier": 2}).validate()
+        result = engine.run(pose, {"src_points": src, "tgt_points": tgt, "src_features": features, "tgt_features": features, "source_rays": bundle(), "target_rays": bundle()})
+        raw = [item for item in result.raw_archive.hypotheses if item.round_id == 1]
+        self.assertTrue(any(not item.entered_refinement_pool for item in raw))
+        self.assertTrue({item.hypothesis_id for item in raw}.issubset({item.hypothesis_id for item in result.post_refinement_archive.hypotheses}))
+
+    def test_large_pose_flip_is_rejected(self):
+        src, tgt, pose, _ = points()
+        parent = PoseHypothesis(1, 0, 1, pose, pose.clone(), src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "ray_guided")
+        child_pose = pose.clone()
+        child_pose[0, 0, 0] = -1.0
+        child_pose[0, 1, 1] = -1.0
+        child_pose[0, 0, 3] = 1.0
+        child = PoseHypothesis(2, 1, 1, pose, child_pose, src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "ray_guided_refined")
+        parent.validation_ray_score, parent.search_free_violation, parent.geometry_rmse = 1.0, 0.2, 0.2
+        child.validation_ray_score, child.search_free_violation, child.geometry_rmse = 0.1, 0.1, 0.1
+        accepted, diagnostics = search()._accept_refined_child(parent, child)
+        self.assertFalse(accepted)
+        self.assertFalse(diagnostics["within_trust_region"])
+
+    def test_refined_child_id_follows_raw_parent_ids(self):
+        src, tgt, pose, _ = points()
+        make = lambda: PoseHypothesis(-1, -1, 1, pose, pose.clone(), src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "ray_guided")
+        raw_archive = HypothesisArchive()
+        parents = [make(), make()]
+        child = make()
+        raw_archive.assign_ids(parents)
+        raw_archive.assign_ids([child])
+        self.assertEqual([item.hypothesis_id for item in parents], [0, 1])
+        self.assertEqual(child.hypothesis_id, 2)
 
     def test_raw_search_uses_one_physical_evaluation_path(self):
         self.assertFalse(hasattr(search(), "_prescore"))
@@ -307,19 +366,20 @@ class IterativeRayTests(unittest.TestCase):
         first = PoseHypothesis(0, -1, 0, pose, pose, src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "r1")
         future = PoseHypothesis(2, 1, 3, pose, pose, src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "ray_guided")
         raw_archive = HypothesisArchive(hypotheses=[first, future])
-        refined_archive = HypothesisArchive(hypotheses=[first])
+        refined_archive = HypothesisArchive(hypotheses=[first, future])
         raw_audits = [
             {"raw_re": 20.0, "raw_te": 40.0, "raw_success": 0},
             {"raw_re": 1.0, "raw_te": 1.0, "raw_success": 1},
         ]
         refined_audits = [
             {"local_refined_re": 20.0, "local_refined_te": 40.0, "local_refined_success": 0},
+            {"local_refined_re": 1.0, "local_refined_te": 1.0, "local_refined_success": 1},
         ]
         before = audit_round(raw_archive, raw_audits, refined_archive, refined_audits, 1, 0, 15.0, 30.0)
         after = audit_round(raw_archive, raw_audits, refined_archive, refined_audits, 3, 0, 15.0, 30.0)
         self.assertEqual(before["cumulative_raw_oracle_success"], 0)
         self.assertEqual(after["cumulative_raw_oracle_success"], 1)
-        self.assertEqual(after["cumulative_refined_oracle_success"], 0)
+        self.assertEqual(after["cumulative_post_refinement_oracle_success"], 1)
 
     def test_active_max_rounds_executes_real_loop(self):
         src, tgt, pose, features = points()

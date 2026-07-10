@@ -111,30 +111,32 @@ def audit_archive_prefix(archive, audits, round_id, rotation_threshold, translat
     }
 
 
-def audit_round(raw_archive, raw_audits, refined_archive, refined_audits, round_id, incumbent_id, rotation_threshold, translation_threshold):
+def audit_round(raw_archive, raw_audits, post_refinement_archive, post_refinement_audits, round_id, incumbent_id, rotation_threshold, translation_threshold):
     raw = audit_archive_prefix(
         raw_archive, raw_audits, round_id, rotation_threshold, translation_threshold,
         "raw_re", "raw_te", "raw_success",
     )
-    refined = audit_archive_prefix(
-        refined_archive, refined_audits, round_id, rotation_threshold, translation_threshold,
+    post_refinement = audit_archive_prefix(
+        post_refinement_archive, post_refinement_audits, round_id, rotation_threshold, translation_threshold,
         "local_refined_re", "local_refined_te", "local_refined_success",
     )
-    eligible = [(hypothesis, audit) for hypothesis, audit in zip(refined_archive.hypotheses, refined_audits) if hypothesis.round_id <= round_id]
+    eligible = [(hypothesis, audit) for hypothesis, audit in zip(post_refinement_archive.hypotheses, post_refinement_audits) if hypothesis.round_id <= round_id]
     selected = next((audit for hypothesis, audit in eligible if hypothesis.hypothesis_id == incumbent_id), None)
     if selected is None:
         raise ValueError(f"Round {round_id} incumbent {incumbent_id} is absent from its archive prefix.")
+    if post_refinement["cumulative_oracle_success"] < raw["cumulative_oracle_success"]:
+        raise RuntimeError("Post-refinement archive must retain every raw candidate.")
     return {
         "round_raw_oracle_success": raw["round_oracle_success"],
         "cumulative_raw_oracle_success": raw["cumulative_oracle_success"],
         "raw_oracle_best_re": raw["oracle_best_re"],
         "raw_oracle_best_te": raw["oracle_best_te"],
         "first_raw_success_round": raw["first_success_round"],
-        "round_refined_oracle_success": refined["round_oracle_success"],
-        "cumulative_refined_oracle_success": refined["cumulative_oracle_success"],
-        "refined_oracle_best_re": refined["oracle_best_re"],
-        "refined_oracle_best_te": refined["oracle_best_te"],
-        "first_refined_success_round": refined["first_success_round"],
+        "round_post_refinement_oracle_success": post_refinement["round_oracle_success"],
+        "cumulative_post_refinement_oracle_success": post_refinement["cumulative_oracle_success"],
+        "post_refinement_oracle_best_re": post_refinement["oracle_best_re"],
+        "post_refinement_oracle_best_te": post_refinement["oracle_best_te"],
+        "first_post_refinement_success_round": post_refinement["first_success_round"],
         "selected_re": selected["local_refined_re"],
         "selected_te": selected["local_refined_te"],
         "selected_success": selected["local_refined_success"],
@@ -148,6 +150,7 @@ def build_search(config, local_regenerator):
         local_corr_max_points=ray_config.local_corr_max_points,
         local_knn_radius=ray_config.local_knn_radius,
         local_mutual_k=ray_config.local_mutual_k,
+        refine_corr_radius=ray_config.refine_corr_radius,
         escape_lambda=ray_config.escape_lambda,
         independent_explore_fraction=ray_config.independent_explore_fraction,
         local_regenerator=local_regenerator,
@@ -285,54 +288,75 @@ def run_experiment(config):
                 })
             result = search.run(r1.pose, inference_inputs, initial_hypothesis=r1)
             raw_audited = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.raw_archive.hypotheses]
-            refined_audited = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.refined_archive.hypotheses]
+            post_refinement_audited = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.post_refinement_archive.hypotheses]
             for row, audit in zip(result.raw_candidate_logs, raw_audited):
                 candidate_rows.append({**row, **audit})
-            for row, audit in zip(result.candidate_logs, refined_audited):
+            for row, audit in zip(result.candidate_logs, post_refinement_audited):
                 candidate_rows.append({**row, **audit})
-            selected = audit_hypothesis(result.refined_archive.incumbent, pair.gt_transform, config.re_thre, config.te_thre)
+            refinement_audited = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.refinement_candidates]
+            for row, audit in zip(result.refinement_logs, refinement_audited):
+                candidate_rows.append({**row, **audit})
+            selected = audit_hypothesis(result.archive.incumbent, pair.gt_transform, config.re_thre, config.te_thre)
             first_raw_success_round = next((item.round_id for item, audit in zip(result.raw_archive.hypotheses, raw_audited) if audit["raw_success"]), -1)
-            first_refined_success_round = next((item.round_id for item, audit in zip(result.refined_archive.hypotheses, refined_audited) if audit["local_refined_success"]), -1)
+            first_post_refinement_success_round = next((item.round_id for item, audit in zip(result.post_refinement_archive.hypotheses, post_refinement_audited) if audit["local_refined_success"]), -1)
             r1_audit = audit_hypothesis(r1, pair.gt_transform, config.re_thre, config.te_thre)
             r1_failure = int(not r1_audit["local_refined_success"])
-            raw_repaired_before, refined_repaired_before = False, False
+            raw_repaired_before, post_refinement_repaired_before = False, False
             for row in result.round_logs:
+                correct_raw_until_round = [
+                    hypothesis for hypothesis, audit in zip(result.raw_archive.hypotheses, raw_audited)
+                    if 0 < hypothesis.round_id <= row["round_id"] and audit["raw_success"]
+                ]
+                refinement_pool_recall = float(
+                    sum(hypothesis.entered_refinement_pool for hypothesis in correct_raw_until_round) / len(correct_raw_until_round)
+                ) if correct_raw_until_round else 0.0
                 audited_round = audit_round(
                     result.raw_archive,
                     raw_audited,
-                    result.refined_archive,
-                    refined_audited,
+                    result.post_refinement_archive,
+                    post_refinement_audited,
                     row["round_id"],
                     row["incumbent_id"],
                     config.re_thre,
                     config.te_thre,
                 )
                 raw_repaired_now = bool(r1_failure and audited_round["cumulative_raw_oracle_success"] and not raw_repaired_before)
-                refined_repaired_now = bool(r1_failure and audited_round["cumulative_refined_oracle_success"] and not refined_repaired_before)
+                post_refinement_repaired_now = bool(r1_failure and audited_round["cumulative_post_refinement_oracle_success"] and not post_refinement_repaired_before)
                 raw_repaired_before = raw_repaired_before or bool(r1_failure and audited_round["cumulative_raw_oracle_success"])
-                refined_repaired_before = refined_repaired_before or bool(r1_failure and audited_round["cumulative_refined_oracle_success"])
+                post_refinement_repaired_before = post_refinement_repaired_before or bool(r1_failure and audited_round["cumulative_post_refinement_oracle_success"])
                 round_rows.append({
                     **row,
                     **audited_round,
                     "r1_failure": r1_failure,
                     "r1_failure_raw_oracle_success": int(r1_failure and audited_round["cumulative_raw_oracle_success"]),
-                    "r1_failure_refined_oracle_success": int(r1_failure and audited_round["cumulative_refined_oracle_success"]),
+                    "r1_failure_post_refinement_oracle_success": int(r1_failure and audited_round["cumulative_post_refinement_oracle_success"]),
                     "newly_raw_repaired_failure": int(raw_repaired_now),
-                    "newly_refined_repaired_failure": int(refined_repaired_now),
+                    "newly_post_refinement_repaired_failure": int(post_refinement_repaired_now),
+                    "refinement_pool_recall": refinement_pool_recall,
+                    "correct_raw_candidate_count": len(correct_raw_until_round),
                 })
+            correct_raw = [
+                hypothesis for hypothesis, audit in zip(result.raw_archive.hypotheses, raw_audited)
+                if hypothesis.round_id > 0 and audit["raw_success"]
+            ]
+            refinement_pool_recall = float(
+                sum(hypothesis.entered_refinement_pool for hypothesis in correct_raw) / len(correct_raw)
+            ) if correct_raw else 0.0
             pair_rows.append({
                 "pair_id": pair.pair_id,
                 "r1_success": r1_audit["local_refined_success"],
                 "r1_failure": r1_failure,
                 "raw_oracle_success": int(any(item["raw_success"] for item in raw_audited)),
-                "refined_oracle_success": int(any(item["local_refined_success"] for item in refined_audited)),
+                "post_refinement_oracle_success": int(any(item["local_refined_success"] for item in post_refinement_audited)),
                 "selected_success": selected["local_refined_success"],
                 "selected_re": selected["local_refined_re"],
                 "selected_te": selected["local_refined_te"],
                 "first_raw_success_round": first_raw_success_round,
-                "first_refined_success_round": first_refined_success_round,
+                "first_post_refinement_success_round": first_post_refinement_success_round,
                 "raw_candidate_count": len(result.raw_archive.hypotheses),
-                "refined_candidate_count": len(result.refined_archive.hypotheses),
+                "post_refinement_candidate_count": len(result.post_refinement_archive.hypotheses),
+                "refinement_pool_recall": refinement_pool_recall,
+                "correct_raw_candidate_count": len(correct_raw),
                 "r1_time": r1_time,
                 "ray_load_time": ray_load_time,
                 **result.timings,
@@ -346,28 +370,30 @@ def run_experiment(config):
     summary = {
         "pairs": len(pair_rows),
         "raw_oracle_rr": float(np.mean([row["raw_oracle_success"] for row in pair_rows])) if pair_rows else 0.0,
-        "refined_oracle_rr": float(np.mean([row["refined_oracle_success"] for row in pair_rows])) if pair_rows else 0.0,
+        "post_refinement_oracle_rr": float(np.mean([row["post_refinement_oracle_success"] for row in pair_rows])) if pair_rows else 0.0,
         "selected_rr": float(np.mean([row["selected_success"] for row in pair_rows])) if pair_rows else 0.0,
         "mean_re": float(np.mean([row["selected_re"] for row in pair_rows])) if pair_rows else 0.0,
         "mean_te": float(np.mean([row["selected_te"] for row in pair_rows])) if pair_rows else 0.0,
         "r1_failure_count": int(sum(row["r1_failure"] for row in pair_rows)),
         "r1_failure_raw_oracle_rr": float(np.mean([row["raw_oracle_success"] for row in pair_rows if row["r1_failure"]])) if any(row["r1_failure"] for row in pair_rows) else 0.0,
-        "r1_failure_refined_oracle_rr": float(np.mean([row["refined_oracle_success"] for row in pair_rows if row["r1_failure"]])) if any(row["r1_failure"] for row in pair_rows) else 0.0,
-        "selected_rr_on_refined_repairable": float(np.mean([row["selected_success"] for row in pair_rows if row["r1_failure"] and row["refined_oracle_success"]])) if any(row["r1_failure"] and row["refined_oracle_success"] for row in pair_rows) else 0.0,
+        "r1_failure_post_refinement_oracle_rr": float(np.mean([row["post_refinement_oracle_success"] for row in pair_rows if row["r1_failure"]])) if any(row["r1_failure"] for row in pair_rows) else 0.0,
+        "selected_rr_on_post_refinement_repairable": float(np.mean([row["selected_success"] for row in pair_rows if row["r1_failure"] and row["post_refinement_oracle_success"]])) if any(row["r1_failure"] and row["post_refinement_oracle_success"] for row in pair_rows) else 0.0,
+        "refinement_pool_recall": float(np.mean([row["refinement_pool_recall"] for row in pair_rows if row["correct_raw_candidate_count"]])) if any(row["correct_raw_candidate_count"] for row in pair_rows) else 0.0,
         "round_metrics": {
             str(round_id): {
                 "pairs": len(rows),
                 "raw_oracle_rr": float(np.mean([row["cumulative_raw_oracle_success"] for row in rows])),
-                "refined_oracle_rr": float(np.mean([row["cumulative_refined_oracle_success"] for row in rows])),
+                "post_refinement_oracle_rr": float(np.mean([row["cumulative_post_refinement_oracle_success"] for row in rows])),
                 "selected_rr": float(np.mean([row["selected_success"] for row in rows])),
                 "r1_failure_raw_oracle_rr": float(np.mean([row["r1_failure_raw_oracle_success"] for row in rows if row["r1_failure"]])) if any(row["r1_failure"] for row in rows) else 0.0,
-                "r1_failure_refined_oracle_rr": float(np.mean([row["r1_failure_refined_oracle_success"] for row in rows if row["r1_failure"]])) if any(row["r1_failure"] for row in rows) else 0.0,
+                "r1_failure_post_refinement_oracle_rr": float(np.mean([row["r1_failure_post_refinement_oracle_success"] for row in rows if row["r1_failure"]])) if any(row["r1_failure"] for row in rows) else 0.0,
                 "newly_raw_repaired_failures": int(sum(row["newly_raw_repaired_failure"] for row in rows)),
-                "newly_refined_repaired_failures": int(sum(row["newly_refined_repaired_failure"] for row in rows)),
+                "newly_post_refinement_repaired_failures": int(sum(row["newly_post_refinement_repaired_failure"] for row in rows)),
+                "refinement_pool_recall": float(np.mean([row["refinement_pool_recall"] for row in rows if row["correct_raw_candidate_count"]])) if any(row["correct_raw_candidate_count"] for row in rows) else 0.0,
                 "raw_oracle_best_re": float(np.mean([row["raw_oracle_best_re"] for row in rows])),
                 "raw_oracle_best_te": float(np.mean([row["raw_oracle_best_te"] for row in rows])),
-                "refined_oracle_best_re": float(np.mean([row["refined_oracle_best_re"] for row in rows])),
-                "refined_oracle_best_te": float(np.mean([row["refined_oracle_best_te"] for row in rows])),
+                "post_refinement_oracle_best_re": float(np.mean([row["post_refinement_oracle_best_re"] for row in rows])),
+                "post_refinement_oracle_best_te": float(np.mean([row["post_refinement_oracle_best_te"] for row in rows])),
             }
             for round_id in sorted({row["round_id"] for row in round_rows})
             for rows in [[row for row in round_rows if row["round_id"] == round_id]]

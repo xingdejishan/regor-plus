@@ -14,6 +14,12 @@ class IterativeRayConfig:
     local_corr_max_points: int = 64
     local_knn_radius: float = 0.30
     local_mutual_k: int = 3
+    refine_corr_radius: float = 0.15
+    refine_trust_rotation_deg: float = 15.0
+    refine_trust_translation_m: float = 0.30
+    refine_validation_min_improvement: float = 0.01
+    refine_free_violation_tolerance: float = 0.005
+    refine_rmse_tolerance: float = 0.01
     active_rays_per_round: int = 3000
     ray_variance_min_observers: int = 2
     search_frame_fraction: float = 0.70
@@ -74,6 +80,10 @@ class IterativeRayConfig:
             raise ValueError("descriptor_topk, seed_group_count, and local_corr_max_points are invalid.")
         if self.local_knn_radius <= 0 or self.local_mutual_k < 1:
             raise ValueError("local correspondence settings are invalid.")
+        if self.refine_corr_radius <= 0 or self.refine_trust_rotation_deg <= 0 or self.refine_trust_translation_m <= 0:
+            raise ValueError("refinement radius and trust-region settings are invalid.")
+        if self.refine_validation_min_improvement < 0 or self.refine_free_violation_tolerance < 0 or self.refine_rmse_tolerance < 0:
+            raise ValueError("refinement acceptance tolerances must be non-negative.")
         if self.active_rays_per_round < 1 or self.ray_variance_min_observers < 2 or not 0.0 < self.search_frame_fraction < 1.0:
             raise ValueError("active_rays_per_round, ray_variance_min_observers, or search_frame_fraction is invalid.")
         if self.ray_trunc_margin <= 0 or self.ray_surface_sigma <= 0 or self.min_valid_ray_count < 1:
