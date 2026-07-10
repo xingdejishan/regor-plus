@@ -30,18 +30,6 @@ class ConstraintMemory:
         translation = torch.linalg.norm(first[:3, 3] - second[:3, 3])
         return torch.sqrt((angle / rotation_scale) ** 2 + (translation / translation_scale) ** 2)
 
-    def pose_penalty_batch(self, poses):
-        if not self.basins:
-            return torch.zeros(poses.shape[0], device=poses.device, dtype=poses.dtype)
-        penalties = []
-        for pose in poses:
-            values = [
-                torch.exp(-self.pose_distance(pose, basin.pose, basin.rotation_radius, basin.translation_radius) ** 2)
-                for basin in self.basins
-            ]
-            penalties.append(torch.stack(values).max())
-        return torch.stack(penalties)
-
     def nearest_pose_distance(self, pose):
         if not self.basins:
             return float("inf")

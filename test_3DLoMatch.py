@@ -124,14 +124,13 @@ def build_search(config, local_regenerator):
         local_knn_radius=ray_config.local_knn_radius,
         local_mutual_k=ray_config.local_mutual_k,
         escape_lambda=ray_config.escape_lambda,
-        history_lambda=ray_config.history_lambda,
         independent_explore_fraction=ray_config.independent_explore_fraction,
         local_regenerator=local_regenerator,
         seed_group_count=ray_config.seed_group_count,
     )
     return ray_config, IterativeRaySearch(
         ray_config,
-        RaySelector(ray_config.active_rays_per_round),
+        RaySelector(ray_config.active_rays_per_round, ray_config.ray_variance_min_observers),
         RayConstraintBuilder(
             ray_config.ray_trunc_margin,
             ray_config.ray_surface_sigma,

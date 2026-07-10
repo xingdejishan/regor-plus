@@ -104,11 +104,13 @@ def _canonicalize_residuals(keys, residuals):
     return RayResidualSignature(unique_keys, values, representative)
 
 
-def align_ray_signatures(signatures):
+def align_ray_signatures(signatures, min_observers=None, return_presence=False):
     signatures = [signature for signature in signatures if signature.keys.numel()]
     if not signatures:
         device = torch.device("cpu")
-        return torch.empty((0, 3), dtype=torch.long, device=device), torch.empty((0, 0), device=device)
+        empty_keys = torch.empty((0, 3), dtype=torch.long, device=device)
+        empty_values = torch.empty((0, 0), device=device)
+        return (empty_keys, empty_values, torch.empty((0, 0), dtype=torch.bool, device=device)) if return_presence else (empty_keys, empty_values)
     all_keys = torch.cat([signature.keys for signature in signatures], dim=0)
     unique_keys, inverse = torch.unique(all_keys, dim=0, sorted=True, return_inverse=True)
     offsets, present, values = 0, [], []
@@ -121,8 +123,12 @@ def align_ray_signatures(signatures):
         vector[ids] = signature.residuals
         present.append(mask)
         values.append(vector)
-    common = torch.stack(present).all(dim=0)
-    return unique_keys[common], torch.stack(values, dim=0)[:, common]
+    presence = torch.stack(present)
+    minimum = len(signatures) if min_observers is None else int(min_observers)
+    observed = presence.sum(dim=0) >= minimum
+    aligned_values = torch.stack(values, dim=0)[:, observed]
+    aligned_presence = presence[:, observed]
+    return (unique_keys[observed], aligned_values, aligned_presence) if return_presence else (unique_keys[observed], aligned_values)
 
 
 def _load_manifest(path):

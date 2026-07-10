@@ -19,8 +19,8 @@ class PoseHypothesis:
     generation_mode: str
     descriptor_score: float = 0.0
     predicted_escape_score: float = 0.0
-    history_penalty: float = 0.0
     search_ray_score: float = float("inf")
+    search_free_violation: float = float("inf")
     validation_ray_score: float = float("inf")
     surface_support: float = 0.0
     valid_observation_count: int = 0
@@ -29,7 +29,9 @@ class PoseHypothesis:
     bidirectional_consistency: float = 0.0
     nearest_history_distance: float = float("inf")
     signature_similarity: float = 0.0
+    search_insufficient_evidence: bool = False
     insufficient_evidence: bool = False
+    rejected_by_history: bool = False
     ray_signature: object | None = None
 
     @property
@@ -48,6 +50,10 @@ class PoseHypothesis:
     def correspondence_count(self):
         return int(self.src_corr.shape[1])
 
+    @property
+    def has_sufficient_evidence(self):
+        return not self.search_insufficient_evidence and not self.insufficient_evidence
+
 
 @dataclass(frozen=True)
 class DescriptorCache:
@@ -56,13 +62,12 @@ class DescriptorCache:
 
 
 class RayGuidedRegenerator:
-    def __init__(self, descriptor_topk, local_corr_max_points, local_knn_radius, local_mutual_k, escape_lambda, history_lambda, independent_explore_fraction, local_regenerator=None, seed_group_count=None):
+    def __init__(self, descriptor_topk, local_corr_max_points, local_knn_radius, local_mutual_k, escape_lambda, independent_explore_fraction, local_regenerator=None, seed_group_count=None):
         self.descriptor_topk = int(descriptor_topk)
         self.local_corr_max_points = int(local_corr_max_points)
         self.local_knn_radius = float(local_knn_radius)
         self.local_mutual_k = int(local_mutual_k)
         self.escape_lambda = float(escape_lambda)
-        self.history_lambda = float(history_lambda)
         self.independent_explore_fraction = float(independent_explore_fraction)
         self.local_regenerator = local_regenerator
         self.seed_group_count = int(seed_group_count) if seed_group_count is not None else None
@@ -184,7 +189,18 @@ class RayGuidedRegenerator:
                 groups.append(group)
         return groups
 
-    def generate_hypotheses(self, seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features, constraints, memory, candidate_count, round_id, parent_id):
+    def refine_hypothesis(self, hypothesis, src_points, tgt_points, src_features, tgt_features):
+        src = src_points[0] if src_points.ndim == 3 else src_points
+        tgt = tgt_points[0] if tgt_points.ndim == 3 else tgt_points
+        seed_src = src[hypothesis.seed_ids[:, 0]][None]
+        seed_tgt = tgt[hypothesis.seed_ids[:, 1]][None]
+        corr_src, corr_tgt, refined_pose = self._local_refine(seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features)
+        hypothesis.src_corr = corr_src
+        hypothesis.tgt_corr = corr_tgt
+        hypothesis.pose_local_refined = refined_pose
+        return hypothesis
+
+    def generate_hypotheses(self, seed_src, seed_tgt, src_points, tgt_points, src_features, tgt_features, constraints, candidate_count, round_id, parent_id):
         if seed_src is not None and seed_tgt is not None:
             if seed_src.shape[1] != seed_tgt.shape[1] or seed_src.shape[1] < 3:
                 raise ValueError("Explicit seed correspondences must be paired and contain at least three entries.")
@@ -208,15 +224,13 @@ class RayGuidedRegenerator:
             pose_raw = rigid_transform_3d(grouped_src, grouped_tgt)
             descriptor_score = float(descriptor_scores[group].mean().item())
             escape_score = self._escape_score(pose_raw, current_pose, constraints) if mode != "independent" else 0.0
-            history_penalty = float(memory.pose_penalty_batch(pose_raw).mean().item())
-            score = descriptor_score + self.escape_lambda * escape_score - self.history_lambda * history_penalty
+            score = descriptor_score + self.escape_lambda * escape_score
             return {
                 "pairs": group_pairs,
                 "descriptor_scores": descriptor_scores[group],
                 "pose_raw": pose_raw,
                 "descriptor_score": descriptor_score,
                 "escape_score": escape_score,
-                "history_penalty": history_penalty,
                 "score": score,
                 "mode": mode,
             }
@@ -239,7 +253,6 @@ class RayGuidedRegenerator:
                     "pose_raw": pose_raw,
                     "descriptor_score": 0.0,
                     "escape_score": self._escape_score(pose_raw, current_pose, constraints),
-                    "history_penalty": float(memory.pose_penalty_batch(pose_raw).mean().item()),
                     "score": 0.0,
                     "mode": "explicit_seed",
                 })
@@ -249,20 +262,18 @@ class RayGuidedRegenerator:
             group_pairs = record["pairs"]
             grouped_src = src[group_pairs[:, 0]][None]
             grouped_tgt = tgt[group_pairs[:, 1]][None]
-            corr_src, corr_tgt, pose_refined = self._local_refine(grouped_src, grouped_tgt, src_points, tgt_points, src_features, tgt_features)
             hypotheses.append(PoseHypothesis(
                 hypothesis_id=-1,
                 parent_id=int(parent_id),
                 round_id=int(round_id),
                 pose_raw=record["pose_raw"],
-                pose_local_refined=pose_refined,
-                src_corr=corr_src,
-                tgt_corr=corr_tgt,
+                pose_local_refined=record["pose_raw"],
+                src_corr=grouped_src,
+                tgt_corr=grouped_tgt,
                 correspondence_scores=record["descriptor_scores"],
                 seed_ids=group_pairs.detach().clone(),
                 generation_mode=record["mode"],
                 descriptor_score=record["descriptor_score"],
                 predicted_escape_score=record["escape_score"],
-                history_penalty=record["history_penalty"],
             ))
         return hypotheses

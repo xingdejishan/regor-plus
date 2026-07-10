@@ -56,9 +56,9 @@ def search(max_rounds=2, time_budget=0.0):
     )
     return IterativeRaySearch(
         config,
-        RaySelector(config.active_rays_per_round),
+        RaySelector(config.active_rays_per_round, config.ray_variance_min_observers),
         RayConstraintBuilder(config.ray_trunc_margin, config.ray_surface_sigma),
-        RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 1.0, 0.2),
+        RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 0.2),
         RayPoseValidator(config.ray_trunc_margin, config.ray_surface_sigma, 1.0, 1),
     )
 
@@ -67,17 +67,25 @@ class IterativeRayTests(unittest.TestCase):
     def test_guided_seed_is_consumed(self):
         src, tgt, pose, features = points()
         constraints = EscapeConstraints(pose[0], (), torch.empty((0, 6)), torch.empty(0), torch.empty(0), torch.zeros(6), torch.zeros((6, 6)), 0, float("inf"), 0.0, 0.0, 0.0)
-        generator = RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 1.0, 0.2)
-        first = generator.generate_hypotheses(src[:, :3], tgt[:, :3], src, tgt, features, features, constraints, ConstraintMemory(), 4, 1, 0)
-        second = generator.generate_hypotheses(src[:, 1:], tgt[:, 1:], src, tgt, features, features, constraints, ConstraintMemory(), 4, 1, 0)
+        generator = RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 0.2)
+        first = generator.generate_hypotheses(src[:, :3], tgt[:, :3], src, tgt, features, features, constraints, 4, 1, 0)
+        second = generator.generate_hypotheses(src[:, 1:], tgt[:, 1:], src, tgt, features, features, constraints, 4, 1, 0)
         self.assertNotEqual(first[0].seed_ids.tolist(), second[0].seed_ids.tolist())
         self.assertFalse(torch.equal(first[0].src_corr, second[0].src_corr))
 
     def test_regenerator_returns_multiple_hypotheses(self):
         src, tgt, pose, features = points()
         constraints = EscapeConstraints(pose[0], (), torch.empty((0, 6)), torch.empty(0), torch.empty(0), torch.zeros(6), torch.zeros((6, 6)), 0, float("inf"), 0.0, 0.0, 0.0)
-        hypotheses = RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 1.0, 0.2).generate_hypotheses(None, None, src, tgt, features, features, constraints, ConstraintMemory(), 4, 1, 0)
+        hypotheses = RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 0.2).generate_hypotheses(None, None, src, tgt, features, features, constraints, 4, 1, 0)
         self.assertGreaterEqual(len(hypotheses), 2)
+
+    def test_generator_defers_refinement_and_has_no_memory_input(self):
+        src, tgt, pose, features = points()
+        constraints = EscapeConstraints(pose[0], (), torch.empty((0, 6)), torch.empty(0), torch.empty(0), torch.zeros(6), torch.zeros((6, 6)), 0, float("inf"), 0.0, 0.0, 0.0)
+        generator = RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 0.2)
+        hypotheses = generator.generate_hypotheses(None, None, src, tgt, features, features, constraints, 4, 1, 0)
+        self.assertNotIn("memory", inspect.signature(generator.generate_hypotheses).parameters)
+        self.assertTrue(all(torch.allclose(item.pose_raw, item.pose_local_refined) for item in hypotheses))
 
     def test_pose_nms_removes_duplicates(self):
         src, tgt, pose, features = points()
@@ -131,6 +139,29 @@ class IterativeRayTests(unittest.TestCase):
         memory.add(RejectedBasin(1, pose, old_signature.keys, old_signature, 1.0, torch.eye(6), 1.0, 1.0))
         repeated, _, _ = memory.repeated_basin(pose, new_signature, 1.0, 0.9, 0.01)
         self.assertFalse(repeated)
+
+    def test_history_basin_keeps_physically_improved_nearby_pose(self):
+        _, _, pose, _ = points()
+        signature = RayResidualSignature(torch.tensor([[0, 0, 0], [0, 0, 1]]), torch.tensor([1.0, 0.5]), torch.tensor([0, 1]))
+        memory = ConstraintMemory()
+        memory.add(RejectedBasin(1, pose, signature.keys, signature, 1.0, torch.eye(6), 1.0, 1.0))
+        repeated, _, _ = memory.repeated_basin(pose, signature, 0.8, 0.9, 0.01)
+        self.assertFalse(repeated)
+
+    def test_negative_memory_requires_evidence_and_both_bad_margins(self):
+        src, tgt, pose, _ = points()
+        incumbent = PoseHypothesis(0, -1, 0, pose, pose, src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "r1")
+        incumbent.validation_ray_score = 0.2
+        incumbent.search_free_violation = 0.1
+        candidate = PoseHypothesis(1, 0, 1, pose, pose, src[:, :3], tgt[:, :3], torch.ones(3), torch.zeros((3, 2), dtype=torch.long), "ray_guided")
+        candidate.validation_ray_score = 0.3
+        candidate.search_free_violation = 0.12
+        self.assertTrue(search()._is_negative_basin(candidate, incumbent))
+        candidate.search_insufficient_evidence = True
+        self.assertFalse(search()._is_negative_basin(candidate, incumbent))
+        candidate.search_insufficient_evidence = False
+        candidate.search_free_violation = 0.105
+        self.assertFalse(search()._is_negative_basin(candidate, incumbent))
 
     def test_constraint_uses_frame_level_camera_pose(self):
         rotation = torch.eye(4)
@@ -191,7 +222,7 @@ class IterativeRayTests(unittest.TestCase):
             1.0,
             0.5,
         )
-        score = RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 1.0, 0.2)._escape_score(candidate[None], current, constraints)
+        score = RayGuidedRegenerator(3, 4, 2.0, 1, 1.0, 0.2)._escape_score(candidate[None], current, constraints)
         self.assertAlmostEqual(score, 0.0, places=5)
 
     def test_opposite_directions_never_share_a_ray_key(self):
@@ -201,6 +232,18 @@ class IterativeRayTests(unittest.TestCase):
         source_signature = ray_signature(evidence["source"])
         common_keys, _ = align_ray_signatures([target_signature, source_signature])
         self.assertEqual(common_keys.shape[0], 0)
+
+    def test_selector_uses_rays_seen_by_two_candidates_not_all_candidates(self):
+        current = RayResidualSignature(torch.tensor([[0, 0, 0], [0, 0, 1]]), torch.tensor([0.1, 0.4]), torch.tensor([0, 1]))
+        first = RayResidualSignature(torch.tensor([[0, 0, 0], [0, 0, 2]]), torch.tensor([1.0, 0.2]), torch.tensor([0, 1]))
+        second = RayResidualSignature(torch.tensor([[0, 0, 1], [0, 0, 2]]), torch.tensor([0.2, 0.3]), torch.tensor([0, 1]))
+        all_common, _ = align_ray_signatures([current, first, second])
+        keys, _, presence = align_ray_signatures([current, first, second], min_observers=2, return_presence=True)
+        self.assertEqual(all_common.shape[0], 0)
+        self.assertEqual(keys.shape[0], 3)
+        self.assertTrue(torch.equal(presence.sum(dim=0), torch.tensor([2, 2, 2])))
+        order = RaySelector(2)._rank(current, [first, second])
+        self.assertEqual(int(order[0]), 0)
 
     def test_iterative_config_rejects_unknown_and_missing_keys(self):
         values = search().config.report()

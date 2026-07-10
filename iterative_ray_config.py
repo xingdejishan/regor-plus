@@ -7,6 +7,7 @@ class IterativeRayConfig:
     search_max_rounds: int = 4
     search_time_budget_seconds: float = 0.0
     candidates_per_round: int = 16
+    candidate_pool_multiplier: int = 2
     independent_explore_fraction: float = 0.2
     descriptor_topk: int = 16
     seed_group_count: int = 32
@@ -14,6 +15,7 @@ class IterativeRayConfig:
     local_knn_radius: float = 0.30
     local_mutual_k: int = 3
     active_rays_per_round: int = 3000
+    ray_variance_min_observers: int = 2
     search_frame_fraction: float = 0.70
     ray_trunc_margin: float = 0.05
     ray_surface_sigma: float = 0.03
@@ -27,7 +29,8 @@ class IterativeRayConfig:
     history_signature_similarity: float = 0.90
     history_energy_tolerance: float = 0.01
     escape_lambda: float = 1.0
-    history_lambda: float = 1.0
+    history_bad_margin: float = 0.05
+    history_search_energy_margin: float = 0.01
     validation_surface_weight: float = 1.0
     validation_min_improvement: float = 0.01
     validation_min_surface_support: float = 0.0
@@ -59,8 +62,8 @@ class IterativeRayConfig:
     def validate(self):
         if self.method not in {"r1_only", "iterative_ray", "repeated_regor", "shuffled_ray"}:
             raise ValueError("method must be r1_only, iterative_ray, repeated_regor, or shuffled_ray.")
-        if self.search_max_rounds < 0 or self.candidates_per_round < 1:
-            raise ValueError("search_max_rounds must be non-negative and candidates_per_round must be positive.")
+        if self.search_max_rounds < 0 or self.candidates_per_round < 1 or self.candidate_pool_multiplier < 1:
+            raise ValueError("search_max_rounds, candidates_per_round, and candidate_pool_multiplier are invalid.")
         if self.method != "r1_only" and self.search_max_rounds < 1:
             raise ValueError("search methods require search_max_rounds >= 1.")
         if self.search_time_budget_seconds < 0:
@@ -71,8 +74,8 @@ class IterativeRayConfig:
             raise ValueError("descriptor_topk, seed_group_count, and local_corr_max_points are invalid.")
         if self.local_knn_radius <= 0 or self.local_mutual_k < 1:
             raise ValueError("local correspondence settings are invalid.")
-        if self.active_rays_per_round < 1 or not 0.0 < self.search_frame_fraction < 1.0:
-            raise ValueError("active_rays_per_round or search_frame_fraction is invalid.")
+        if self.active_rays_per_round < 1 or self.ray_variance_min_observers < 2 or not 0.0 < self.search_frame_fraction < 1.0:
+            raise ValueError("active_rays_per_round, ray_variance_min_observers, or search_frame_fraction is invalid.")
         if self.ray_trunc_margin <= 0 or self.ray_surface_sigma <= 0 or self.min_valid_ray_count < 1:
             raise ValueError("ray evidence settings are invalid.")
         if not self.ray_manifest:
@@ -85,8 +88,10 @@ class IterativeRayConfig:
             raise ValueError("history basin radii must be positive.")
         if not 0.0 <= self.history_signature_similarity <= 1.0:
             raise ValueError("history_signature_similarity must be in [0, 1].")
-        if self.escape_lambda < 0 or self.history_lambda < 0 or self.validation_surface_weight < 0:
+        if self.escape_lambda < 0 or self.validation_surface_weight < 0:
             raise ValueError("score weights must be non-negative.")
+        if self.history_bad_margin < 0 or self.history_search_energy_margin < 0:
+            raise ValueError("history negative-memory margins must be non-negative.")
         if self.validation_min_improvement < 0 or self.stagnation_rounds < 1:
             raise ValueError("validation_min_improvement or stagnation_rounds is invalid.")
         if self.enable_candidate_merge:
