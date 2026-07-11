@@ -15,13 +15,18 @@ class BasinRecord:
 
 
 class CorrespondenceMemory:
-    def __init__(self, src_points, tgt_points, src_features, tgt_features, config):
+    def __init__(self, src_points, tgt_points, src_features, tgt_features, config, required_src_indices=None, required_tgt_indices=None):
         self.config = config
         self.src_points = self._points(src_points)
         self.tgt_points = self._points(tgt_points)
         self.device = self.src_points.device
         self.dtype = self.src_points.dtype
-        self.src_indices, self.tgt_indices, self.descriptor_score, self.topk_descriptor_scores = self._build_candidates(src_features, tgt_features)
+        self.src_indices, self.tgt_indices, self.descriptor_score, self.topk_descriptor_scores = self._build_candidates(
+            src_features,
+            tgt_features,
+            required_src_indices,
+            required_tgt_indices,
+        )
         self.count = int(self.src_indices.numel())
         self.topk = int(self.topk_descriptor_scores.shape[1])
         self.alpha = config.memory_alpha0 + config.memory_descriptor_prior * self.descriptor_score
@@ -43,7 +48,7 @@ class CorrespondenceMemory:
     def _features(features):
         return features[0] if features.ndim == 3 else features
 
-    def _build_candidates(self, src_features, tgt_features):
+    def _build_candidates(self, src_features, tgt_features, required_src_indices=None, required_tgt_indices=None):
         src = torch.nn.functional.normalize(self._features(src_features), dim=1)
         tgt = torch.nn.functional.normalize(self._features(tgt_features), dim=1)
         scores = src @ tgt.transpose(0, 1)
@@ -53,7 +58,40 @@ class CorrespondenceMemory:
         flat = values.reshape(-1)
         minimum, maximum = flat.min(), flat.max()
         normalized = (flat - minimum) / torch.clamp_min(maximum - minimum, 1e-8)
-        return source.reshape(-1), indices.reshape(-1), normalized, values
+        source = source.reshape(-1)
+        indices = indices.reshape(-1)
+        if (required_src_indices is None) != (required_tgt_indices is None):
+            raise ValueError("Required source and target candidate indices must be provided together.")
+        if required_src_indices is None:
+            return source, indices, normalized, values
+        required_source = torch.as_tensor(required_src_indices, device=src.device, dtype=torch.long).reshape(-1)
+        required_target = torch.as_tensor(required_tgt_indices, device=tgt.device, dtype=torch.long).reshape(-1)
+        if required_source.numel() != required_target.numel():
+            raise ValueError("Required source and target candidate index counts must match.")
+        if required_source.numel() == 0:
+            return source, indices, normalized, values
+        if int(required_source.min()) < 0 or int(required_source.max()) >= src.shape[0] or int(required_target.min()) < 0 or int(required_target.max()) >= tgt.shape[0]:
+            raise ValueError("Required candidate index is out of range.")
+        target_count = int(tgt.shape[0])
+        candidate_keys = source * target_count + indices
+        required_keys = required_source * target_count + required_target
+        sorted_keys = torch.sort(candidate_keys).values
+        positions = torch.searchsorted(sorted_keys, required_keys)
+        present = torch.zeros_like(positions, dtype=torch.bool)
+        in_bounds = positions < sorted_keys.numel()
+        present[in_bounds] = sorted_keys[positions[in_bounds]] == required_keys[in_bounds]
+        missing = ~present
+        if not bool(missing.any()):
+            return source, indices, normalized, values
+        extra_source = required_source[missing]
+        extra_target = required_target[missing]
+        extra_score = (scores[extra_source, extra_target] - minimum) / torch.clamp_min(maximum - minimum, 1e-8)
+        return (
+            torch.cat([source, extra_source]),
+            torch.cat([indices, extra_target]),
+            torch.cat([normalized, extra_score.clamp(0.0, 1.0)]),
+            values,
+        )
 
     def _build_relation_graph(self):
         source_count = int(self.src_points.shape[0])
@@ -136,9 +174,15 @@ class CorrespondenceMemory:
         ambiguity = descriptor_entropy.mean()
         centered = points - points.mean(dim=0, keepdim=True)
         covariance = centered.transpose(0, 1) @ centered / max(1, points.shape[0])
-        eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
-        lambda12 = eigenvalues[0] / torch.clamp_min(eigenvalues[1], 1e-8)
-        lambda13 = eigenvalues[0] / torch.clamp_min(eigenvalues[2], 1e-8)
+        covariance = torch.nan_to_num(covariance, nan=0.0, posinf=0.0, neginf=0.0)
+        covariance = 0.5 * (covariance + covariance.transpose(0, 1))
+        covariance = covariance + torch.eye(3, dtype=self.dtype, device=self.device) * torch.finfo(self.dtype).eps
+        try:
+            eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
+        except RuntimeError:
+            eigenvalues = torch.zeros(3, dtype=self.dtype, device=self.device)
+        linear_ratio = eigenvalues[1] / torch.clamp_min(eigenvalues[2], 1e-8)
+        planar_ratio = eigenvalues[0] / torch.clamp_min(eigenvalues[1], 1e-8)
         voxels = torch.floor(points / self.config.memory_coverage_voxel_size).long()
         coverage = torch.as_tensor(torch.unique(voxels, dim=0).shape[0] / self.source_voxel_count, dtype=self.dtype, device=self.device)
         source_groups = torch.floor(points / self.config.memory_cross_group_voxel_size).long()
@@ -149,26 +193,95 @@ class CorrespondenceMemory:
         upper = torch.triu(torch.ones_like(compatibility, dtype=torch.bool), diagonal=1)
         cross_group = upper & torch.any(source_groups[:, None] != source_groups[None], dim=-1)
         cross_group_agreement = compatibility[cross_group].mean() if bool(cross_group.any()) else torch.zeros((), dtype=self.dtype, device=self.device)
-        return torch.stack([ambiguity, lambda12, lambda13, coverage, cross_group_agreement])
+        return torch.stack([ambiguity, linear_ratio, planar_ratio, coverage, cross_group_agreement])
 
     def degeneracy_penalty(self, support):
         signature = self.support_signature(support)
         return (
-            torch.relu(torch.as_tensor(self.config.memory_min_lambda12_ratio, dtype=self.dtype, device=self.device) - signature[1])
-            + torch.relu(torch.as_tensor(self.config.memory_min_lambda13_ratio, dtype=self.dtype, device=self.device) - signature[2])
+            torch.relu(torch.as_tensor(self.config.memory_tau_linear, dtype=self.dtype, device=self.device) - signature[1])
+            + torch.relu(torch.as_tensor(self.config.memory_tau_planar, dtype=self.dtype, device=self.device) - signature[2])
             + torch.relu(torch.as_tensor(self.config.memory_min_coverage, dtype=self.dtype, device=self.device) - signature[3])
             + torch.relu(torch.as_tensor(self.config.memory_min_cross_group_agreement, dtype=self.dtype, device=self.device) - signature[4])
         )
 
     def is_degenerate(self, support):
-        if support.numel() < self.config.memory_support_min:
-            return True
+        diagnostics = self.support_diagnostics(support)
+        return bool(self.support_hard_rejection_reasons(diagnostics))
+
+    def support_diagnostics(self, support):
+        support = torch.as_tensor(support, dtype=torch.long, device=self.device).reshape(-1)
         signature = self.support_signature(support)
-        return bool(
-            signature[1] < self.config.memory_min_lambda12_ratio
-            or signature[2] < self.config.memory_min_lambda13_ratio
-            or signature[3] < self.config.memory_min_coverage
-            or signature[4] < self.config.memory_min_cross_group_agreement
+        source_ids = self.src_indices[support] if support.numel() else torch.empty(0, dtype=torch.long, device=self.device)
+        target_ids = self.tgt_indices[support] if support.numel() else torch.empty(0, dtype=torch.long, device=self.device)
+        duplicate_correspondence = int(
+            torch.unique(source_ids).numel() != source_ids.numel()
+            or torch.unique(target_ids).numel() != target_ids.numel()
+        )
+        lambda2_over_lambda1 = 0.0
+        lambda3_over_lambda2 = 0.0
+        lambda3_over_lambda1 = 0.0
+        eigen_failed = 0
+        if support.numel():
+            points = self.src_points[source_ids]
+            centered = points - points.mean(dim=0, keepdim=True)
+            covariance = centered.transpose(0, 1) @ centered / max(1, points.shape[0])
+            covariance = torch.nan_to_num(covariance, nan=0.0, posinf=0.0, neginf=0.0)
+            covariance = 0.5 * (covariance + covariance.transpose(0, 1))
+            covariance = covariance + torch.eye(3, dtype=self.dtype, device=self.device) * torch.finfo(self.dtype).eps
+            try:
+                eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
+                lambda2_over_lambda1 = float((eigenvalues[1] / torch.clamp_min(eigenvalues[2], 1e-8)).item())
+                lambda3_over_lambda2 = float((eigenvalues[0] / torch.clamp_min(eigenvalues[1], 1e-8)).item())
+                lambda3_over_lambda1 = float((eigenvalues[0] / torch.clamp_min(eigenvalues[2], 1e-8)).item())
+            except RuntimeError:
+                eigen_failed = 1
+        return {
+            "support_size": int(support.numel()),
+            "duplicate_correspondence": duplicate_correspondence,
+            "lambda2_over_lambda1": lambda2_over_lambda1,
+            "lambda3_over_lambda2": lambda3_over_lambda2,
+            "lambda3_over_lambda1": lambda3_over_lambda1,
+            "coverage": float(signature[3].item()),
+            "cross_group_score": float(signature[4].item()),
+            "eigen_failed": eigen_failed,
+            "linear_degenerate": int(lambda2_over_lambda1 < self.config.memory_tau_linear),
+            "planar_degenerate": int(lambda3_over_lambda2 < self.config.memory_tau_planar),
+            "low_coverage": int(signature[3] < self.config.memory_min_coverage),
+            "cross_group_inconsistent": int(signature[4] < self.config.memory_min_cross_group_agreement),
+        }
+
+    @staticmethod
+    def support_constraint_reasons(diagnostics):
+        reasons = []
+        if diagnostics["support_size"] < 3:
+            reasons.append("support_too_small")
+        if diagnostics["duplicate_correspondence"]:
+            reasons.append("duplicate_correspondence")
+        if diagnostics["linear_degenerate"]:
+            reasons.append("linear_degenerate")
+        if diagnostics["planar_degenerate"]:
+            reasons.append("planar_degenerate")
+        if diagnostics["low_coverage"]:
+            reasons.append("low_coverage")
+        if diagnostics["cross_group_inconsistent"]:
+            reasons.append("cross_group_inconsistent")
+        return reasons
+
+    def support_hard_rejection_reasons(self, diagnostics):
+        reasons = []
+        if diagnostics["support_size"] < self.config.memory_support_min:
+            reasons.append("support_too_small")
+        if diagnostics["duplicate_correspondence"]:
+            reasons.append("duplicate_correspondence")
+        if diagnostics["linear_degenerate"]:
+            reasons.append("linear_degenerate")
+        return reasons
+
+    def structure_penalty(self, diagnostics):
+        return (
+            self.config.memory_lambda_structure_planar * float(diagnostics["planar_degenerate"])
+            + self.config.memory_lambda_structure_coverage * max(0.0, self.config.memory_min_coverage - float(diagnostics["coverage"]))
+            + self.config.memory_lambda_structure_cross_group * max(0.0, self.config.memory_min_cross_group_agreement - float(diagnostics["cross_group_score"]))
         )
 
     def presearch_basin_penalty(self, signature, support):
@@ -245,22 +358,37 @@ class CorrespondenceMemory:
     def correspondence_points(self, candidate_ids):
         return self.src_points[self.src_indices[candidate_ids]][None], self.tgt_points[self.tgt_indices[candidate_ids]][None]
 
-    def map_cached_correspondences(self, src_corr, tgt_corr, radius):
-        source = self._points(src_corr)
-        target = self._points(tgt_corr)
-        if source.numel() == 0 or target.numel() == 0:
-            return torch.empty(0, dtype=torch.long, device=self.device), {"r1_corr_count": 0, "r1_mapped_count": 0, "r1_mapping_ratio": 0.0}
-        source_distance, source_ids = torch.cdist(source, self.src_points).min(dim=1)
-        target_distance, target_ids = torch.cdist(target, self.tgt_points).min(dim=1)
-        valid = (source_distance <= radius) & (target_distance <= radius)
-        candidate_ids = []
-        for source_id, target_id in zip(source_ids[valid].tolist(), target_ids[valid].tolist()):
-            candidates = torch.where((self.src_indices == source_id) & (self.tgt_indices == target_id))[0]
-            if candidates.numel():
-                candidate_ids.append(int(candidates[0]))
-        mapped = torch.tensor(candidate_ids, dtype=torch.long, device=self.device).unique() if candidate_ids else torch.empty(0, dtype=torch.long, device=self.device)
-        count = int(source.shape[0])
-        return mapped, {"r1_corr_count": count, "r1_mapped_count": int(mapped.numel()), "r1_mapping_ratio": float(mapped.numel() / max(1, count))}
+    def map_cached_indices(self, src_corr_indices, tgt_corr_indices):
+        source = torch.as_tensor(src_corr_indices, dtype=torch.long, device=self.device).reshape(-1)
+        target = torch.as_tensor(tgt_corr_indices, dtype=torch.long, device=self.device).reshape(-1)
+        if source.numel() != target.numel():
+            raise ValueError("Cached R1 source and target correspondence index counts must match.")
+        if source.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device), {
+                "r1_corr_count": 0,
+                "r1_mapped_corr_count": 0,
+                "r1_mapped_count": 0,
+                "r1_mapping_ratio": 0.0,
+            }
+        if int(source.min()) < 0 or int(source.max()) >= self.src_points.shape[0] or int(target.min()) < 0 or int(target.max()) >= self.tgt_points.shape[0]:
+            raise ValueError("Cached R1 correspondence index is out of range for the current sampled keypoints.")
+        target_count = int(self.tgt_points.shape[0])
+        candidate_keys = self.src_indices.to(torch.long) * target_count + self.tgt_indices.to(torch.long)
+        cached_keys = source * target_count + target
+        sorted_keys, order = torch.sort(candidate_keys)
+        positions = torch.searchsorted(sorted_keys, cached_keys)
+        in_bounds = positions < sorted_keys.numel()
+        valid = torch.zeros_like(in_bounds)
+        valid[in_bounds] = sorted_keys[positions[in_bounds]] == cached_keys[in_bounds]
+        mapped = order[positions[valid]].unique() if bool(valid.any()) else torch.empty(0, dtype=torch.long, device=self.device)
+        count = int(source.numel())
+        mapped_corr_count = int(valid.sum().item())
+        return mapped, {
+            "r1_corr_count": count,
+            "r1_mapped_corr_count": mapped_corr_count,
+            "r1_mapped_count": int(mapped.numel()),
+            "r1_mapping_ratio": float(mapped_corr_count / count),
+        }
 
     def _rotation_vector(self, rotation):
         cosine = torch.clamp((torch.trace(rotation) - 1.0) * 0.5, -1.0, 1.0)

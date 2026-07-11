@@ -35,12 +35,15 @@ class MemoryGraphConfig:
     memory_support_max: int = 32
     memory_support_trial_count: int = 8
     memory_signature_entropy_temperature: float = 0.10
-    memory_min_lambda12_ratio: float = 0.10
-    memory_min_lambda13_ratio: float = 0.05
+    memory_tau_linear: float = 0.01
+    memory_tau_planar: float = 0.05
     memory_min_coverage: float = 0.002
     memory_coverage_voxel_size: float = 0.10
     memory_cross_group_voxel_size: float = 0.30
     memory_min_cross_group_agreement: float = 0.50
+    memory_lambda_structure_planar: float = 1.0
+    memory_lambda_structure_coverage: float = 100.0
+    memory_lambda_structure_cross_group: float = 1.0
     memory_hypotheses_per_round: int = 24
     memory_max_rounds: int = 8
     memory_max_sampling_attempts: int = 96
@@ -51,7 +54,6 @@ class MemoryGraphConfig:
     memory_refine_trust_rotation_deg: float = 15.0
     memory_refine_trust_translation: float = 0.30
     memory_refine_min_score_improvement: float = 0.01
-    memory_r1_mapping_radius: float = 1e-5
     memory_r1_min_mapping_ratio: float = 0.80
     memory_r1_low_confidence_inlier_ratio: float = 0.50
     memory_r1_low_confidence_error_ratio: float = 1.00
@@ -119,13 +121,15 @@ class MemoryGraphConfig:
             self.memory_basin_presearch_penalty,
         ) < 0:
             raise ValueError("memory score weights must be non-negative.")
-        if self.memory_signature_entropy_temperature <= 0 or not 0 <= self.memory_min_lambda12_ratio <= 1 or not 0 <= self.memory_min_lambda13_ratio <= 1 or not 0 <= self.memory_min_coverage <= 1 or self.memory_coverage_voxel_size <= 0 or self.memory_cross_group_voxel_size <= 0 or not 0 <= self.memory_min_cross_group_agreement <= 1 or not 0 <= self.memory_basin_presearch_min_support_overlap <= 1:
+        if self.memory_signature_entropy_temperature <= 0 or not 0 <= self.memory_tau_linear <= 1 or not 0 <= self.memory_tau_planar <= 1 or not 0 <= self.memory_min_coverage <= 1 or self.memory_coverage_voxel_size <= 0 or self.memory_cross_group_voxel_size <= 0 or not 0 <= self.memory_min_cross_group_agreement <= 1 or not 0 <= self.memory_basin_presearch_min_support_overlap <= 1:
             raise ValueError("memory structural constraints are invalid.")
+        if min(self.memory_lambda_structure_planar, self.memory_lambda_structure_coverage, self.memory_lambda_structure_cross_group) < 0:
+            raise ValueError("memory structure penalty weights must be non-negative.")
         if self.memory_hypotheses_per_round < 1 or self.memory_max_rounds < 1 or self.memory_max_sampling_attempts < self.memory_hypotheses_per_round or self.memory_inlier_threshold <= 0 or self.memory_tls_threshold <= 0 or self.memory_tls_iters < 0:
             raise ValueError("memory search budget is invalid.")
         if self.memory_refine_trust_rotation_deg <= 0 or self.memory_refine_trust_translation <= 0 or self.memory_refine_min_score_improvement < 0:
             raise ValueError("memory refinement settings are invalid.")
-        if self.memory_r1_mapping_radius <= 0 or not 0 <= self.memory_r1_min_mapping_ratio <= 1 or not 0 <= self.memory_r1_low_confidence_inlier_ratio <= 1 or self.memory_r1_low_confidence_error_ratio <= 0:
+        if not 0 <= self.memory_r1_min_mapping_ratio <= 1 or not 0 <= self.memory_r1_low_confidence_inlier_ratio <= 1 or self.memory_r1_low_confidence_error_ratio <= 0:
             raise ValueError("memory R1 initialization settings are invalid.")
         if not 0 < self.memory_prosac_initial_fraction <= 1 or self.memory_prosac_growth < 0:
             raise ValueError("memory PROSAC schedule is invalid.")

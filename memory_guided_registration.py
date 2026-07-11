@@ -1,9 +1,22 @@
 from dataclasses import dataclass
 import math
+import time
 
 import torch
 
 from correspondence_memory import CorrespondenceMemory
+
+
+REJECTION_REASON_KEYS = (
+    "support_too_small",
+    "duplicate_correspondence",
+    "linear_degenerate",
+    "planar_degenerate",
+    "low_coverage",
+    "cross_group_inconsistent",
+    "svd_failed",
+    "duplicate_pose",
+)
 
 
 @dataclass
@@ -21,6 +34,7 @@ class MemoryHypothesis:
     evidence_score: float
     support_signature: torch.Tensor
     basin_key: tuple | None
+    structure_penalty: float = 0.0
     refinement_accepted: bool = False
     refinement_reject_reason: str = ""
 
@@ -118,7 +132,7 @@ class MemoryGuidedRegistration:
         rank = memory.rank()[candidate_ids]
         return candidate_ids[torch.topk(rank, k=self.config.memory_support_max).indices]
 
-    def _make_hypothesis(self, memory, hypothesis_id, parent_id, round_id, stage, pose_raw, pose, support_ids):
+    def _make_hypothesis(self, memory, hypothesis_id, parent_id, round_id, stage, pose_raw, pose, support_ids, structure_penalty=0.0):
         inliers, residuals = self._verify(memory, pose)
         signature_ids = support_ids if support_ids.numel() else self._signature_support(memory, inliers)
         signature = memory.support_signature(signature_ids)
@@ -134,10 +148,11 @@ class MemoryGuidedRegistration:
             support_ids=support_ids,
             inlier_ids=torch.where(inliers)[0],
             residuals=residuals,
-            score=score,
+            score=score - float(structure_penalty),
             evidence_score=evidence_score,
             support_signature=signature,
             basin_key=basin_key,
+            structure_penalty=float(structure_penalty),
         )
 
     def _prosac_seed(self, ranked, round_id, hypothesis_index):
@@ -195,21 +210,32 @@ class MemoryGuidedRegistration:
             "mean_inlier_error": mean_error,
             "score": hypothesis.score,
             "evidence_score": hypothesis.evidence_score,
+            "structure_penalty": hypothesis.structure_penalty,
             "basin_key": list(hypothesis.basin_key) if hypothesis.basin_key is not None else [],
             "support_objective": support_objective,
             "accepted": int(accepted),
             "reject_reason": reject_reason,
         }
 
-    def run(self, src_points, tgt_points, src_features, tgt_features, initial_pose=None, initial_support_ids=None, initial_src_corr=None, initial_tgt_corr=None):
+    def run(self, src_points, tgt_points, src_features, tgt_features, initial_pose=None, initial_support_ids=None, initial_src_indices=None, initial_tgt_indices=None):
         if self.config.memory_require_r1_cache and initial_pose is None:
             raise ValueError("memory_graph requires the fixed R1 pose as a permanent round-0 parent.")
-        memory = CorrespondenceMemory(src_points, tgt_points, src_features, tgt_features, self.config)
-        mapping = {"r1_corr_count": 0, "r1_mapped_count": 0, "r1_mapping_ratio": 0.0}
-        if initial_src_corr is not None and initial_tgt_corr is not None:
-            initial_support_ids, mapping = memory.map_cached_correspondences(initial_src_corr, initial_tgt_corr, self.config.memory_r1_mapping_radius)
+        if (initial_src_indices is None) != (initial_tgt_indices is None):
+            raise ValueError("Cached R1 source and target correspondence indices must be provided together.")
+        memory = CorrespondenceMemory(
+            src_points,
+            tgt_points,
+            src_features,
+            tgt_features,
+            self.config,
+            required_src_indices=initial_src_indices,
+            required_tgt_indices=initial_tgt_indices,
+        )
+        mapping = {"r1_corr_count": 0, "r1_mapped_corr_count": 0, "r1_mapped_count": 0, "r1_mapping_ratio": 0.0}
+        if initial_src_indices is not None:
+            initial_support_ids, mapping = memory.map_cached_indices(initial_src_indices, initial_tgt_indices)
             if mapping["r1_mapping_ratio"] < self.config.memory_r1_min_mapping_ratio:
-                raise RuntimeError(f"R1 candidate mapping ratio {mapping['r1_mapping_ratio']:.3f} is below {self.config.memory_r1_min_mapping_ratio:.3f}.")
+                raise RuntimeError(f"R1 direct index mapping ratio {mapping['r1_mapping_ratio']:.3f} is below {self.config.memory_r1_min_mapping_ratio:.3f}.")
         raw_hypotheses, post_refinement_hypotheses, candidate_logs, round_logs = [], [], [], []
         next_id = 0
         r1_hypothesis = None
@@ -286,7 +312,11 @@ class MemoryGuidedRegistration:
                 "round_hypothesis_id": r1_hypothesis.hypothesis_id,
                 "round_score": r1_hypothesis.score,
                 "raw_candidate_count": 1,
+                "raw_generated": 0,
                 "accepted_child_count": 0,
+                "refinement_attempted": 0,
+                "refinement_accepted": 0,
+                "sampling_attempts": 0,
                 "inlier_count": int(r1_hypothesis.inlier_ids.numel()),
                 "coverage": r1_coverage,
                 "best_coverage": r1_coverage,
@@ -296,41 +326,87 @@ class MemoryGuidedRegistration:
                 "graph_delta": 0.0,
                 "basin_count": 0,
                 "stale_rounds": 0,
+                "round_runtime_seconds": 0.0,
+                **{key: 0 for key in REJECTION_REASON_KEYS},
             })
         stale = 0
         for round_id in range(1, self.config.memory_max_rounds + 1):
+            round_started = time.perf_counter()
             best_before_round = best
             ranked = torch.argsort(memory.rank(), descending=True)
             current_round, novel = [], 0
             sampling_attempts, raw_generated = 0, 0
+            rejection_counts = {key: 0 for key in REJECTION_REASON_KEYS}
             while raw_generated < self.config.memory_hypotheses_per_round and sampling_attempts < self.config.memory_max_sampling_attempts:
                 seed = self._prosac_seed(ranked, round_id - 1, sampling_attempts)
                 sampling_attempts += 1
                 support = memory.expand_support(seed)
                 support_objective = float(memory.support_objective(support).item())
                 presearch_basin_penalty = float(memory.presearch_basin_penalty(memory.support_signature(support), support).item())
+                diagnostics = memory.support_diagnostics(support)
+                constraint_reasons = memory.support_constraint_reasons(diagnostics)
+                hard_rejection_reasons = memory.support_hard_rejection_reasons(diagnostics)
+                structure_penalty = memory.structure_penalty(diagnostics)
+                for key in constraint_reasons:
+                    rejection_counts[key] += 1
+                attempt_log = {
+                    "round_id": round_id,
+                    "attempt_index": sampling_attempts,
+                    "hypothesis_id": -1,
+                    "parent_id": -1,
+                    "stage": "attempt",
+                    "seed_id": seed,
+                    "support_count": int(support.numel()),
+                    "support_objective": support_objective,
+                    "presearch_basin_penalty": presearch_basin_penalty,
+                    "accepted": 0,
+                    "raw_generated": 0,
+                    "duplicate_pose": 0,
+                    "structure_penalty": structure_penalty,
+                    "constraint_reasons": "|".join(constraint_reasons),
+                    **diagnostics,
+                }
                 if memory.is_degenerate(support):
                     candidate_logs.append({
-                        "round_id": round_id,
-                        "hypothesis_id": -1,
-                        "parent_id": -1,
-                        "stage": "raw",
-                        "seed_id": seed,
-                        "support_count": int(support.numel()),
-                        "support_objective": support_objective,
-                        "presearch_basin_penalty": presearch_basin_penalty,
-                        "accepted": 0,
-                        "reject_reason": "degenerate_support",
+                        **attempt_log,
+                        "reject_reason": "|".join(hard_rejection_reasons) if hard_rejection_reasons else "unclassified_degenerate",
                     })
                     continue
                 src, tgt = memory.correspondence_points(support)
-                pose_raw = self._weighted_rigid(src[0], tgt[0], memory.estimation_weights(support))
-                raw = self._make_hypothesis(memory, next_id, -1, round_id, "raw", pose_raw, pose_raw, support)
+                try:
+                    pose_raw = self._weighted_rigid(src[0], tgt[0], memory.estimation_weights(support))
+                    if not bool(torch.isfinite(pose_raw).all()):
+                        raise RuntimeError("weighted SVD returned a non-finite pose")
+                except RuntimeError:
+                    rejection_counts["svd_failed"] += 1
+                    candidate_logs.append({
+                        **attempt_log,
+                        "reject_reason": "svd_failed",
+                    })
+                    continue
+                raw = self._make_hypothesis(
+                    memory,
+                    next_id,
+                    -1,
+                    round_id,
+                    "raw",
+                    pose_raw,
+                    pose_raw,
+                    support,
+                    structure_penalty=structure_penalty,
+                )
                 next_id += 1
                 raw_hypotheses.append(raw)
                 post_refinement_hypotheses.append(raw)
                 current_round.append(raw)
                 raw_generated += 1
+                candidate_logs.append({
+                    **attempt_log,
+                    "hypothesis_id": raw.hypothesis_id,
+                    "accepted": 1,
+                    "raw_generated": 1,
+                    "reject_reason": "",
+                })
                 raw_log = self._candidate_log(raw, seed, support_objective, True, "")
                 raw_log["presearch_basin_penalty"] = presearch_basin_penalty
                 candidate_logs.append(raw_log)
@@ -338,7 +414,17 @@ class MemoryGuidedRegistration:
                     _, record = memory.basin_record(raw.pose)
                     novel += int(record is None)
                 pose_refined = self._robust_refine(memory, raw.pose)
-                child = self._make_hypothesis(memory, next_id, raw.hypothesis_id, round_id, "refinement_child", raw.pose_raw, pose_refined, support)
+                child = self._make_hypothesis(
+                    memory,
+                    next_id,
+                    raw.hypothesis_id,
+                    round_id,
+                    "refinement_child",
+                    raw.pose_raw,
+                    pose_refined,
+                    support,
+                    structure_penalty=structure_penalty,
+                )
                 next_id += 1
                 accepted, reject_reason = self._accept_refined_child(raw, child)
                 raw.refinement_accepted = accepted
@@ -363,8 +449,12 @@ class MemoryGuidedRegistration:
                     "round_hypothesis_id": best.hypothesis_id,
                     "round_score": float("-inf"),
                     "raw_candidate_count": 0,
+                    "raw_generated": 0,
                     "accepted_child_count": 0,
+                    "refinement_attempted": 0,
+                    "refinement_accepted": 0,
                     "sampling_attempt_count": sampling_attempts,
+                    "sampling_attempts": sampling_attempts,
                     "sampling_budget_exhausted": 1,
                     "inlier_count": int(best.inlier_ids.numel()),
                     "coverage": self._coverage(memory, best.inlier_ids),
@@ -375,6 +465,8 @@ class MemoryGuidedRegistration:
                     "graph_delta": 0.0,
                     "basin_count": len(memory.basins),
                     "stale_rounds": stale,
+                    "round_runtime_seconds": time.perf_counter() - round_started,
+                    **rejection_counts,
                 })
                 if not self.config.memory_fixed_budget_mode and stale >= self.config.memory_patience:
                     break
@@ -403,8 +495,12 @@ class MemoryGuidedRegistration:
                 "round_hypothesis_id": current.hypothesis_id,
                 "round_score": current.score,
                 "raw_candidate_count": sum(item.stage == "raw" for item in current_round),
+                "raw_generated": raw_generated,
                 "accepted_child_count": sum(item.stage == "refinement_child" for item in current_round),
+                "refinement_attempted": raw_generated,
+                "refinement_accepted": sum(item.stage == "refinement_child" for item in current_round),
                 "sampling_attempt_count": sampling_attempts,
+                "sampling_attempts": sampling_attempts,
                 "sampling_budget_exhausted": int(raw_generated < self.config.memory_hypotheses_per_round),
                 "inlier_count": int(current.inlier_ids.numel()),
                 "coverage": current_coverage,
@@ -415,6 +511,8 @@ class MemoryGuidedRegistration:
                 "graph_delta": graph_delta,
                 "basin_count": len(memory.basins),
                 "stale_rounds": stale,
+                "round_runtime_seconds": time.perf_counter() - round_started,
+                **rejection_counts,
             })
             if not self.config.memory_fixed_budget_mode and self._strong_stop(best, best_coverage):
                 break

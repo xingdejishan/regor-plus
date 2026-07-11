@@ -17,6 +17,10 @@ class RegistrationPair:
     tgt_ray_bundle: RayBundle | None
     gt_transform: torch.Tensor | None
     pair_id: str
+    src_sampled_indices: torch.Tensor
+    tgt_sampled_indices: torch.Tensor
+    src_original_count: int
+    tgt_original_count: int
 
     def inference_inputs(self):
         return {

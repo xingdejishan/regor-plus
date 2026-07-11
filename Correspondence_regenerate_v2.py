@@ -142,7 +142,7 @@ class Regenerator():
 
         return indices_total_src.unsqueeze(0), indices_total_tgt.unsqueeze(0)
 
-    def local_matching(self, src_key_corr, tgt_key_corr, src_corr_knn_idx, tgt_corr_knn_idx, src_point, tgt_point, src_feature, tgt_feature, guide=None):
+    def local_matching(self, src_key_corr, tgt_key_corr, src_corr_knn_idx, tgt_corr_knn_idx, src_point, tgt_point, src_feature, tgt_feature, guide=None, return_indices=False):
         # - src_key_corr: [bs, num_key_corr, 3]
         # - tgt_key_corr: [bs, num_key_corr, 3]
 
@@ -213,9 +213,11 @@ class Regenerator():
         corr_idx = self.global_spatial_fitering_topk_two(src_point_corr1, tgt_point_corr1)
         src_point_corr2 = src_point_corr1[:, corr_idx, :]
         tgt_point_corr2 = tgt_point_corr1[:, corr_idx, :]
+        selected_corr_indices = unique_selected_corr_idx[corr_idx]
         if src_point_corr2.shape[1]<10:
             src_point_corr2 = src_point_corr1
             tgt_point_corr2 = tgt_point_corr1
+            selected_corr_indices = unique_selected_corr_idx
 
 
         if self.DEBUG:
@@ -250,6 +252,8 @@ class Regenerator():
             visualization.draw_registration_corr2(src, tgt, src_key1, tgt_key1, np.eye(4))
             visualization.draw_registration_corr2(src, tgt, src_key2, tgt_key2, np.eye(4))
 
+        if return_indices:
+            return src_point_corr2, tgt_point_corr2, selected_corr_indices
         return src_point_corr2, tgt_point_corr2
 
 
@@ -667,7 +671,7 @@ class Regenerator():
 
         return src_keypts_best_corr, tgt_keypts_best_corr
 
-    def regenerate(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, knn_num=100, sampling_num=100, knn_radius=0.8, use_sampling=False, guide=None, mode="local"):
+    def regenerate(self, src_key_corr, tgt_key_corr, src_point, tgt_point, src_feature, tgt_feature, knn_num=100, sampling_num=100, knn_radius=0.8, use_sampling=False, guide=None, mode="local", return_indices=False):
         """
         Input:
             - src_key_corr: [bs, num_key_corr, 3]
@@ -685,6 +689,8 @@ class Regenerator():
         self.last_match_weights = None
         self.last_r2_candidates = []
         if mode == "paired_local":
+            if return_indices:
+                raise ValueError("paired_local regeneration does not expose local correspondence indices.")
             return self.regenerate_seed_group(
                 src_key_corr,
                 tgt_key_corr,
@@ -711,8 +717,25 @@ class Regenerator():
         src_corr_knn_idx = self.knn_search(src_key_corr, src_point, self.knn_num)
         tgt_corr_knn_idx = self.knn_search(tgt_key_corr, tgt_point, self.knn_num)
 
-        src_corr, tgt_corr = self.local_matching(src_key_corr, tgt_key_corr, src_corr_knn_idx, tgt_corr_knn_idx, src_point, tgt_point, src_feature, tgt_feature, guide=guide)
+        matching = self.local_matching(
+            src_key_corr,
+            tgt_key_corr,
+            src_corr_knn_idx,
+            tgt_corr_knn_idx,
+            src_point,
+            tgt_point,
+            src_feature,
+            tgt_feature,
+            guide=guide,
+            return_indices=return_indices,
+        )
+        if return_indices:
+            src_corr, tgt_corr, correspondence_indices = matching
+        else:
+            src_corr, tgt_corr = matching
 
         final_tran = rigid_transform_3d(src_corr, tgt_corr)
 
+        if return_indices:
+            return src_corr, tgt_corr, final_tran, correspondence_indices
         return src_corr, tgt_corr, final_tran

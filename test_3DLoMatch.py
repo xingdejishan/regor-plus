@@ -5,11 +5,9 @@ import json
 import logging
 import os
 import random
-import subprocess
 import sys
 import time
 from pathlib import Path
-from functools import lru_cache
 
 import numpy as np
 import torch
@@ -64,26 +62,141 @@ def r1_cache_path(cache_dir, pair_index):
     return Path(cache_dir) / f"pair_{pair_index:06d}.pt"
 
 
-@lru_cache(maxsize=1)
-def source_revision():
-    try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
+R1_CACHE_FORMAT_VERSION = 2
+R1_CACHE_ALGORITHM_VERSION = "indexed_r1_v1"
 
 
 def r1_cache_metadata(pair, config):
     settings = {
         "pair_id": pair.pair_id,
+        "cache_format_version": R1_CACHE_FORMAT_VERSION,
+        "r1_algorithm_version": R1_CACHE_ALGORITHM_VERSION,
         "descriptor": str(config.descriptor),
         "seed": int(getattr(config, "seed", 51)),
+        "num_node": str(config.num_node),
+        "use_mutual": bool(config.use_mutual),
+        "d_thre": float(config.d_thre),
+        "num_iterations": int(config.num_iterations),
+        "ratio": float(config.ratio),
+        "k1": int(config.k1),
+        "k2": int(config.k2),
+        "max_points": int(config.max_points),
+        "nms_radius": float(config.nms_radius),
+        "FS_TCD_thre": float(config.FS_TCD_thre),
+        "relax_match_num": int(config.relax_match_num),
+        "NS_by_IC": int(config.NS_by_IC),
         "r1_knn": int(config.r1_knn),
         "r1_sampling": int(config.r1_sampling),
         "inlier_threshold": float(config.inlier_threshold),
-        "commit": source_revision(),
     }
     fingerprint = hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()
-    return {**settings, "fingerprint": fingerprint}
+    return {**settings, "r1_config_fingerprint": fingerprint}
+
+
+def build_r1_cache_payload(pair, pair_index, r1, config):
+    if r1.src_corr_indices is None or r1.tgt_corr_indices is None:
+        raise ValueError("Indexed R1 cache generation requires source and target correspondence indices.")
+    src_corr_indices = r1.src_corr_indices.detach().to(dtype=torch.long, device="cpu").reshape(-1)
+    tgt_corr_indices = r1.tgt_corr_indices.detach().to(dtype=torch.long, device="cpu").reshape(-1)
+    if src_corr_indices.numel() != tgt_corr_indices.numel() or src_corr_indices.numel() < 3:
+        raise ValueError("R1 cache requires at least three paired correspondence indices.")
+    src_sampled_indices = pair.src_sampled_indices.detach().to(dtype=torch.long, device="cpu").reshape(-1)
+    tgt_sampled_indices = pair.tgt_sampled_indices.detach().to(dtype=torch.long, device="cpu").reshape(-1)
+    return {
+        "cache_format_version": R1_CACHE_FORMAT_VERSION,
+        "pair_index": int(pair_index),
+        "pair_id": pair.pair_id,
+        "pose": r1.pose.detach().to(device="cpu"),
+        "src_corr_indices": src_corr_indices,
+        "tgt_corr_indices": tgt_corr_indices,
+        "src_corr_stable_indices": src_sampled_indices[src_corr_indices],
+        "tgt_corr_stable_indices": tgt_sampled_indices[tgt_corr_indices],
+        "src_sampled_indices": src_sampled_indices,
+        "tgt_sampled_indices": tgt_sampled_indices,
+        "src_keypoint_count": int(pair.src_keypoints.shape[1]),
+        "tgt_keypoint_count": int(pair.tgt_keypoints.shape[1]),
+        "src_original_count": int(pair.src_original_count),
+        "tgt_original_count": int(pair.tgt_original_count),
+        "metadata": r1_cache_metadata(pair, config),
+    }
+
+
+def save_r1_cache(pair, pair_index, r1, config):
+    path = r1_cache_path(config.r1_cache_dir, pair_index)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(build_r1_cache_payload(pair, pair_index, r1, config), path)
+    return path
+
+
+def load_r1_cache_payload(config, pair_index):
+    cache_dir = getattr(config, "r1_cache_dir", "")
+    if not cache_dir:
+        raise ValueError("memory_graph requires a non-empty r1_cache_dir with fixed R1 outputs.")
+    path = r1_cache_path(cache_dir, pair_index)
+    if not path.exists():
+        raise FileNotFoundError(f"memory_graph requires fixed R1 cache entry: {path}")
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def _require_index_tensor(payload, key):
+    value = payload.get(key)
+    if not isinstance(value, torch.Tensor) or value.dtype != torch.long or value.ndim != 1:
+        raise TypeError(f"R1 cache field {key} must be a one-dimensional torch.long tensor.")
+    return value
+
+
+def _validate_index_range(indices, upper, key):
+    if indices.numel() and (int(indices.min()) < 0 or int(indices.max()) >= upper):
+        raise ValueError(f"R1 cache field {key} is out of range for {upper} keypoints.")
+
+
+def load_required_r1_cache(pair, pair_index, config, payload=None):
+    payload = load_r1_cache_payload(config, pair_index) if payload is None else payload
+    required = {
+        "cache_format_version", "pair_index", "pair_id", "pose", "src_corr_indices", "tgt_corr_indices",
+        "src_corr_stable_indices", "tgt_corr_stable_indices", "src_sampled_indices", "tgt_sampled_indices",
+        "src_keypoint_count", "tgt_keypoint_count", "src_original_count", "tgt_original_count", "metadata",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise KeyError(f"R1 cache entry {r1_cache_path(config.r1_cache_dir, pair_index)} is missing: {', '.join(missing)}.")
+    if int(payload["cache_format_version"]) != R1_CACHE_FORMAT_VERSION:
+        raise ValueError("R1 cache format is not the indexed fixed-cache format.")
+    if int(payload["pair_index"]) != int(pair_index) or payload["pair_id"] != pair.pair_id:
+        raise ValueError("R1 cache pair index or pair_id does not match the current loader pair.")
+    if payload["metadata"] != r1_cache_metadata(pair, config):
+        raise ValueError("R1 cache configuration fingerprint does not match the fixed experiment configuration.")
+    src_corr_indices = _require_index_tensor(payload, "src_corr_indices")
+    tgt_corr_indices = _require_index_tensor(payload, "tgt_corr_indices")
+    src_corr_stable_indices = _require_index_tensor(payload, "src_corr_stable_indices")
+    tgt_corr_stable_indices = _require_index_tensor(payload, "tgt_corr_stable_indices")
+    src_sampled_indices = _require_index_tensor(payload, "src_sampled_indices")
+    tgt_sampled_indices = _require_index_tensor(payload, "tgt_sampled_indices")
+    if src_corr_indices.numel() != tgt_corr_indices.numel() or src_corr_indices.numel() < 3:
+        raise ValueError("R1 cache correspondence index arrays must be paired and contain at least three entries.")
+    if int(payload["src_keypoint_count"]) != int(pair.src_keypoints.shape[1]) or int(payload["tgt_keypoint_count"]) != int(pair.tgt_keypoints.shape[1]):
+        raise ValueError("R1 cache sampled keypoint counts do not match the current loader output.")
+    if int(payload["src_original_count"]) != int(pair.src_original_count) or int(payload["tgt_original_count"]) != int(pair.tgt_original_count):
+        raise ValueError("R1 cache original keypoint counts do not match the current loader input.")
+    _validate_index_range(src_sampled_indices, pair.src_original_count, "src_sampled_indices")
+    _validate_index_range(tgt_sampled_indices, pair.tgt_original_count, "tgt_sampled_indices")
+    _validate_index_range(src_corr_indices, pair.src_keypoints.shape[1], "src_corr_indices")
+    _validate_index_range(tgt_corr_indices, pair.tgt_keypoints.shape[1], "tgt_corr_indices")
+    if int(torch.unique(src_sampled_indices).numel()) != int(src_sampled_indices.numel()) or int(torch.unique(tgt_sampled_indices).numel()) != int(tgt_sampled_indices.numel()):
+        raise ValueError("R1 cache sampled-keypoint indices must be unique.")
+    if not torch.equal(src_sampled_indices, pair.src_sampled_indices.detach().cpu()) or not torch.equal(tgt_sampled_indices, pair.tgt_sampled_indices.detach().cpu()):
+        raise ValueError("R1 cache sampled-keypoint stable indices do not exactly match the current loader output.")
+    if not torch.equal(src_corr_stable_indices, src_sampled_indices[src_corr_indices]) or not torch.equal(tgt_corr_stable_indices, tgt_sampled_indices[tgt_corr_indices]):
+        raise ValueError("R1 cache correspondence stable indices do not agree with the cached sampled-keypoint indices.")
+    pose = payload["pose"].to(device=pair.src_keypoints.device, dtype=pair.src_keypoints.dtype)
+    if pose.shape != (1, 4, 4):
+        raise ValueError(f"R1 cache pose must have shape (1, 4, 4), got {tuple(pose.shape)}.")
+    return {
+        "pose": pose,
+        "src_corr_indices": src_corr_indices.to(device=pair.src_keypoints.device),
+        "tgt_corr_indices": tgt_corr_indices.to(device=pair.tgt_keypoints.device),
+        "metadata": payload["metadata"],
+    }
 
 
 def load_or_run_r1(pair, pair_index, matcher, regenerator, config):
@@ -91,54 +204,28 @@ def load_or_run_r1(pair, pair_index, matcher, regenerator, config):
     if cache_dir:
         path = r1_cache_path(cache_dir, pair_index)
         if path.exists():
-            if getattr(config, "r1_cache_rng_warmup", False) and pair_index >= int(getattr(config, "r1_cache_rng_warmup_start_index", 1)):
-                run_r1(pair, matcher, regenerator, config)
-            payload = torch.load(path, map_location=pair.src_keypoints.device, weights_only=True)
+            payload = load_r1_cache_payload(config, pair_index)
+            if int(payload.get("cache_format_version", -1)) != R1_CACHE_FORMAT_VERSION:
+                raise ValueError(f"R1 cache {path} is legacy and cannot be used as an indexed cache.")
+            cached = load_required_r1_cache(pair, pair_index, config, payload)
             return PoseHypothesis(
                 hypothesis_id=-1,
                 parent_id=-1,
                 round_id=0,
-                pose_raw=payload["pose"],
-                pose_local_refined=payload["pose"],
-                src_corr=payload["src_corr"],
-                tgt_corr=payload["tgt_corr"],
-                correspondence_scores=torch.ones(payload["src_corr"].shape[1], device=pair.src_keypoints.device, dtype=pair.src_keypoints.dtype),
+                pose_raw=cached["pose"],
+                pose_local_refined=cached["pose"],
+                src_corr=pair.src_keypoints[:, cached["src_corr_indices"]],
+                tgt_corr=pair.tgt_keypoints[:, cached["tgt_corr_indices"]],
+                correspondence_scores=torch.ones(cached["src_corr_indices"].numel(), device=pair.src_keypoints.device, dtype=pair.src_keypoints.dtype),
                 seed_ids=torch.empty((0, 2), device=pair.src_keypoints.device, dtype=torch.long),
                 generation_mode="r1",
+                src_corr_indices=cached["src_corr_indices"],
+                tgt_corr_indices=cached["tgt_corr_indices"],
             )
     r1 = run_r1(pair, matcher, regenerator, config)
     if cache_dir:
-        path = r1_cache_path(cache_dir, pair_index)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "pose": r1.pose.detach().cpu(),
-            "src_corr": r1.src_corr.detach().cpu(),
-            "tgt_corr": r1.tgt_corr.detach().cpu(),
-            "metadata": r1_cache_metadata(pair, config),
-        }, path)
+        save_r1_cache(pair, pair_index, r1, config)
     return r1
-
-
-def load_required_r1_cache(pair, pair_index, config):
-    cache_dir = getattr(config, "r1_cache_dir", "")
-    if not cache_dir:
-        raise ValueError("memory_graph requires a non-empty r1_cache_dir with fixed R1 outputs.")
-    path = r1_cache_path(cache_dir, pair_index)
-    if not path.exists():
-        raise FileNotFoundError(f"memory_graph requires fixed R1 cache entry: {path}")
-    payload = torch.load(path, map_location=pair.src_keypoints.device, weights_only=True)
-    if not {"pose", "src_corr", "tgt_corr", "metadata"}.issubset(payload):
-        raise KeyError(f"R1 cache entry {path} must contain pose, src_corr, tgt_corr, and metadata.")
-    if payload["metadata"] != r1_cache_metadata(pair, config):
-        raise ValueError(f"R1 cache metadata mismatch at {path}; regenerate the fixed cache for this pair/config.")
-    pose = payload["pose"].to(device=pair.src_keypoints.device, dtype=pair.src_keypoints.dtype)
-    if pose.shape != (1, 4, 4):
-        raise ValueError(f"R1 cache pose at {path} must have shape (1, 4, 4), got {tuple(pose.shape)}.")
-    return {
-        "pose": pose,
-        "src_corr": payload["src_corr"].to(device=pair.src_keypoints.device, dtype=pair.src_keypoints.dtype),
-        "tgt_corr": payload["tgt_corr"].to(device=pair.tgt_keypoints.device, dtype=pair.tgt_keypoints.dtype),
-    }
 
 
 def audit_archive_prefix(archive, audits, round_id, rotation_threshold, translation_threshold, re_key, te_key, success_key):
@@ -259,17 +346,48 @@ def build_loader(config, search_config):
     )
 
 
+def build_r1_modules(config):
+    regenerator = Regenerator(
+        inlier_threshold=config.inlier_threshold,
+        num_node=config.num_node,
+        use_mutual=config.use_mutual,
+        d_thre=config.d_thre,
+        num_iterations=config.num_iterations,
+        ratio=config.ratio,
+        nms_radius=config.nms_radius,
+        max_points=config.max_points,
+        k1=config.k1,
+        k2=config.k2,
+    )
+    matcher = Matcher_plus(
+        inlier_threshold=config.inlier_threshold,
+        num_node=config.num_node,
+        use_mutual=config.use_mutual,
+        d_thre=config.d_thre,
+        num_iterations=config.num_iterations,
+        ratio=config.ratio,
+        nms_radius=config.nms_radius,
+        max_points=config.max_points,
+        k1=config.k1,
+        k2=config.k2,
+        FS_TCD_thre=config.FS_TCD_thre,
+        relax_match_num=config.relax_match_num,
+        NS_by_IC=config.NS_by_IC,
+    )
+    return matcher, regenerator
+
+
 def run_r1(pair, matcher, regenerator, config):
     output = matcher.estimator(pair.src_keypoints, pair.tgt_keypoints, pair.src_features, pair.tgt_features)
     _, filtered_src, filtered_tgt, src_corr, tgt_corr, _, _ = output
     seed_source = filtered_src if filtered_src.shape[1] >= 3 else src_corr
     seed_target = filtered_tgt if filtered_tgt.shape[1] >= 3 else tgt_corr
     seed_src, seed_tgt = sample_correspondences(seed_source, seed_target, int(config.r1_sampling))
-    r1_src, r1_tgt, r1_pose = regenerator.regenerate(
+    r1_src, r1_tgt, r1_pose, correspondence_indices = regenerator.regenerate(
         seed_src, seed_tgt,
         pair.src_keypoints, pair.tgt_keypoints,
         pair.src_features, pair.tgt_features,
-        knn_num=int(config.r1_knn), sampling_num=int(config.r1_sampling),
+        knn_num=int(config.r1_knn), sampling_num=int(config.r1_sampling), return_indices=True,
     )
     return PoseHypothesis(
         hypothesis_id=-1,
@@ -282,6 +400,8 @@ def run_r1(pair, matcher, regenerator, config):
         correspondence_scores=torch.ones(r1_src.shape[1], device=r1_src.device, dtype=r1_src.dtype),
         seed_ids=torch.empty((0, 2), device=r1_src.device, dtype=torch.long),
         generation_mode="r1",
+        src_corr_indices=correspondence_indices[:, 0],
+        tgt_corr_indices=correspondence_indices[:, 1],
     )
 
 
@@ -379,11 +499,26 @@ def run_memory_graph_experiment(config, memory_config):
     with torch.no_grad():
         for index in tqdm(range(pair_limit)):
             load_started = time.perf_counter()
-            pair = loader.get_pair(index)
+            payload = load_r1_cache_payload(config, index)
+            if "src_sampled_indices" not in payload or "tgt_sampled_indices" not in payload:
+                raise KeyError("Fixed R1 cache must provide source and target sampled-keypoint stable indices.")
+            pair = loader.get_pair(
+                index,
+                src_sampled_indices_override=payload["src_sampled_indices"],
+                tgt_sampled_indices_override=payload["tgt_sampled_indices"],
+            )
             load_time = time.perf_counter() - load_started
-            r1_cache = load_required_r1_cache(pair, index, config)
+            r1_cache = load_required_r1_cache(pair, index, config, payload)
             model_started = time.perf_counter()
-            result = registrar.run(pair.src_keypoints, pair.tgt_keypoints, pair.src_features, pair.tgt_features, initial_pose=r1_cache["pose"], initial_src_corr=r1_cache["src_corr"], initial_tgt_corr=r1_cache["tgt_corr"])
+            result = registrar.run(
+                pair.src_keypoints,
+                pair.tgt_keypoints,
+                pair.src_features,
+                pair.tgt_features,
+                initial_pose=r1_cache["pose"],
+                initial_src_indices=r1_cache["src_corr_indices"],
+                initial_tgt_indices=r1_cache["tgt_corr_indices"],
+            )
             model_time = time.perf_counter() - model_started
             if result.r1_hypothesis is None:
                 raise RuntimeError("memory_graph required R1 cache but no R1 archive parent was created.")
@@ -406,11 +541,13 @@ def run_memory_graph_experiment(config, memory_config):
                     "pair_id": pair.pair_id,
                     **row,
                     **audited_round,
+                    "r1_success": r1_audit["raw_success"] if r1_audit else 0,
                     "r1_failure": r1_failure,
                     "r1_failure_raw_oracle_success": int(r1_failure and audited_round["cumulative_raw_oracle_success"]),
                     "r1_failure_post_refinement_oracle_success": int(r1_failure and audited_round["cumulative_post_refinement_oracle_success"]),
                     "newly_raw_repaired_failure": int(raw_repaired_now),
                     "newly_post_refinement_repaired_failure": int(post_refinement_repaired_now),
+                    "first_success_round": audited_round["first_post_refinement_success_round"],
                 })
             if result.best is None:
                 selected_re, selected_te = pose_errors(result.pose, pair.gt_transform)
@@ -442,6 +579,7 @@ def run_memory_graph_experiment(config, memory_config):
                 "topk_candidate_inlier_count": fmr_inlier_count,
                 "load_time": load_time,
                 "model_time": model_time,
+                "runtime_seconds": load_time + model_time,
                 **result.memory_summary,
                 **result.r1_initialization,
             })
@@ -504,7 +642,7 @@ def run_experiment(config):
         return run_memory_graph_experiment(config, memory_config)
     local_regenerator = Regenerator(
         inlier_threshold=config.inlier_threshold,
-        num_node="all",
+        num_node=config.num_node,
         use_mutual=config.use_mutual,
         d_thre=config.d_thre,
         num_iterations=config.num_iterations,
@@ -516,7 +654,7 @@ def run_experiment(config):
     )
     r1_regenerator = Regenerator(
         inlier_threshold=config.inlier_threshold,
-        num_node="all",
+        num_node=config.num_node,
         use_mutual=config.use_mutual,
         d_thre=config.d_thre,
         num_iterations=config.num_iterations,
@@ -528,7 +666,7 @@ def run_experiment(config):
     )
     matcher = Matcher_plus(
         inlier_threshold=config.inlier_threshold,
-        num_node="all",
+        num_node=config.num_node,
         use_mutual=config.use_mutual,
         d_thre=config.d_thre,
         num_iterations=config.num_iterations,

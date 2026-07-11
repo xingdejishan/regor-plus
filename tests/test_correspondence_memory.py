@@ -21,8 +21,8 @@ def config(**overrides):
         "memory_tau_g": 0.5,
         "memory_support_min": 3,
         "memory_support_max": 6,
-        "memory_min_lambda12_ratio": 0.01,
-        "memory_min_lambda13_ratio": 0.01,
+        "memory_tau_linear": 0.01,
+        "memory_tau_planar": 0.01,
         "memory_min_coverage": 0.001,
         "memory_coverage_voxel_size": 0.05,
         "memory_cross_group_voxel_size": 0.10,
@@ -123,8 +123,8 @@ class CorrespondenceMemoryTests(unittest.TestCase):
             source_features,
             target_features,
             initial_pose=r1_pose,
-            initial_src_corr=source[:, :6],
-            initial_tgt_corr=target[:, :6],
+            initial_src_indices=torch.arange(6),
+            initial_tgt_indices=torch.arange(6),
         )
         self.assertEqual(result.r1_initialization["r1_initialized"], 1)
         self.assertEqual(result.r1_initialization["r1_mapped_count"], 6)
@@ -157,8 +157,8 @@ class CorrespondenceMemoryTests(unittest.TestCase):
                 source_features,
                 target_features,
                 initial_pose=r1_pose,
-                initial_src_corr=source[:, :6],
-                initial_tgt_corr=target[:, :6],
+                initial_src_indices=torch.arange(6),
+                initial_tgt_indices=torch.arange(6),
             )
         memory = CapturingMemory.instance
         self.assertTrue(torch.equal(memory.alpha, memory.alpha_before))
@@ -210,7 +210,7 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         self.assertLess(float(memory.support_objective(support)), objective_before)
         self.assertEqual(memory.basin_bonus(pose, torch.zeros_like(signature)), 0.0)
 
-    def test_signature_reports_global_coverage_and_planar_degeneracy(self):
+    def test_signature_reports_global_coverage_and_keeps_planar_support_soft(self):
         grid_x, grid_y = torch.meshgrid(torch.arange(4), torch.arange(4), indexing="ij")
         source = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1), torch.zeros(16)], dim=1).float() * 0.1
         target = source + torch.tensor([0.1, 0.0, 0.0])
@@ -221,7 +221,9 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         self.assertEqual(signature.numel(), 5)
         self.assertLess(float(signature[2]), 0.01)
         self.assertLess(float(signature[3]), 1.0)
-        self.assertTrue(memory.is_degenerate(support))
+        diagnostics = memory.support_diagnostics(support)
+        self.assertEqual(diagnostics["planar_degenerate"], 1)
+        self.assertFalse(memory.is_degenerate(support))
 
     def test_memory_search_estimates_full_rigid_pose_and_preserves_raw_seed_pose(self):
         source, target, source_features, target_features, rotation, translation = synthetic_pair()
@@ -249,8 +251,8 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         r1_pose[0, :3, :3], r1_pose[0, :3, 3] = rotation, translation
         result = RejectingRefiner(config(
             memory_max_rounds=1,
-            memory_min_lambda12_ratio=0.0,
-            memory_min_lambda13_ratio=0.0,
+            memory_tau_linear=0.0,
+            memory_tau_planar=0.0,
             memory_min_coverage=0.0,
             memory_min_cross_group_agreement=0.0,
         )).run(source, target, source_features, target_features, initial_pose=r1_pose)

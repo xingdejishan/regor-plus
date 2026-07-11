@@ -47,6 +47,8 @@ class PoseHypothesis:
     child_free_violation: float = float("inf")
     parent_geometry_rmse: float = float("inf")
     child_geometry_rmse: float = float("inf")
+    src_corr_indices: torch.Tensor | None = None
+    tgt_corr_indices: torch.Tensor | None = None
 
     @property
     def pose(self):

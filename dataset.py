@@ -230,7 +230,20 @@ class ThreeDLoMatchLoader(data.Dataset):
             )
         return self._ray_cache[key].to(device)
 
-    def get_pair(self, index):
+    @staticmethod
+    def _override_indices(indices, count, original_count, device, label):
+        indices = torch.as_tensor(indices, device=device, dtype=torch.long).reshape(-1)
+        if int(indices.numel()) != count:
+            raise ValueError(f"{label} sampled-keypoint count mismatch: expected {count}, got {indices.numel()}.")
+        if indices.numel() and (int(indices.min()) < 0 or int(indices.max()) >= original_count):
+            raise ValueError(f"{label} sampled-keypoint index is out of range.")
+        if int(torch.unique(indices).numel()) != int(indices.numel()):
+            raise ValueError(f"{label} sampled-keypoint indices must be unique.")
+        return indices
+
+    def get_pair(self, index, src_sampled_indices_override=None, tgt_sampled_indices_override=None):
+        if (src_sampled_indices_override is None) != (tgt_sampled_indices_override is None):
+            raise ValueError("Source and target sampled-keypoint overrides must be provided together.")
 
         gt_trans = integrate_trans(self.infos['rot'][index], self.infos['trans'][index])
         scene = self.infos['src'][index].split('/')[1]
@@ -250,6 +263,9 @@ class ThreeDLoMatchLoader(data.Dataset):
             tgt_keypts = torch.from_numpy(tgt_keypts.astype(np.float32)).cuda()
             src_features = torch.from_numpy(src_features.astype(np.float32)).cuda()
             tgt_features = torch.from_numpy(tgt_features.astype(np.float32)).cuda()
+            src_sampled_indices = torch.arange(src_keypts.shape[0], device=src_keypts.device, dtype=torch.long)
+            tgt_sampled_indices = torch.arange(tgt_keypts.shape[0], device=tgt_keypts.device, dtype=torch.long)
+            src_original_count, tgt_original_count = int(src_keypts.shape[0]), int(tgt_keypts.shape[0])
             gt_trans = torch.from_numpy(gt_trans.astype(np.float32)).cuda()
             src_overlap, tgt_overlap, overlap_source = load_overlap_prediction(
                 self.overlap_pred_root,
@@ -276,6 +292,9 @@ class ThreeDLoMatchLoader(data.Dataset):
             tgt_keypts = torch.from_numpy(tgt_keypts.astype(np.float32)).cuda()
             src_features = torch.from_numpy(src_features.astype(np.float32)).cuda()
             tgt_features = torch.from_numpy(tgt_features.astype(np.float32)).cuda()
+            src_sampled_indices = torch.arange(src_keypts.shape[0], device=src_keypts.device, dtype=torch.long)
+            tgt_sampled_indices = torch.arange(tgt_keypts.shape[0], device=tgt_keypts.device, dtype=torch.long)
+            src_original_count, tgt_original_count = int(src_keypts.shape[0]), int(tgt_keypts.shape[0])
             gt_trans = torch.from_numpy(gt_trans.astype(np.float32)).cuda()
             src_overlap, tgt_overlap, overlap_source = load_overlap_prediction(
                 self.overlap_pred_root,
@@ -295,32 +314,47 @@ class ThreeDLoMatchLoader(data.Dataset):
             tgt_keypts = data_dict['pcd'][len_src:, :].cuda()
             src_features = data_dict['feats'][:len_src].cuda()
             tgt_features = data_dict['feats'][len_src:].cuda()
+            src_sampled_indices = torch.arange(src_keypts.shape[0], device=src_keypts.device, dtype=torch.long)
+            tgt_sampled_indices = torch.arange(tgt_keypts.shape[0], device=tgt_keypts.device, dtype=torch.long)
+            src_original_count, tgt_original_count = int(src_keypts.shape[0]), int(tgt_keypts.shape[0])
             saliency, overlap = data_dict['saliency'], data_dict['overlaps']
             src_overlap, src_saliency = overlap[:len_src].cuda(), saliency[:len_src].cuda()
             tgt_overlap, tgt_saliency = overlap[len_src:].cuda(), saliency[len_src:].cuda()
             src_scores = src_overlap * src_saliency
             tgt_scores = tgt_overlap * tgt_saliency
-            if not isinstance(self.num_node,str):
+            if not isinstance(self.num_node,str) and src_sampled_indices_override is None:
                 if (src_keypts.size(0) > self.num_node):
                     idx = np.arange(src_keypts.size(0))
                     probs = (src_scores / src_scores.sum()).cpu().numpy().flatten()
                     idx = np.random.choice(idx, size=self.num_node, replace=False, p=probs)
                     src_keypts, src_features, src_overlap = src_keypts[idx], src_features[idx], src_overlap[idx]
+                    src_sampled_indices = src_sampled_indices[torch.as_tensor(idx, device=src_sampled_indices.device)]
                 if (tgt_keypts.size(0) > self.num_node):
                     idx = np.arange(tgt_keypts.size(0))
                     probs = (tgt_scores / tgt_scores.sum()).cpu().numpy().flatten()
                     idx = np.random.choice(idx, size=self.num_node, replace=False, p=probs)
                     tgt_keypts, tgt_features, tgt_overlap = tgt_keypts[idx], tgt_features[idx], tgt_overlap[idx]
+                    tgt_sampled_indices = tgt_sampled_indices[torch.as_tensor(idx, device=tgt_sampled_indices.device)]
             gt_trans = integrate_trans(data_dict['rot'], data_dict['trans']).cuda()
             overlap_source = "predator"
 
-        if not isinstance(self.num_node, str):
+        if src_sampled_indices_override is not None:
+            expected_src_count = min(src_original_count, int(self.num_node)) if not isinstance(self.num_node, str) else src_original_count
+            expected_tgt_count = min(tgt_original_count, int(self.num_node)) if not isinstance(self.num_node, str) else tgt_original_count
+            src_indices = self._override_indices(src_sampled_indices_override, expected_src_count, src_original_count, src_keypts.device, "Source")
+            tgt_indices = self._override_indices(tgt_sampled_indices_override, expected_tgt_count, tgt_original_count, tgt_keypts.device, "Target")
+            src_keypts, src_features, src_overlap = src_keypts[src_indices], src_features[src_indices], src_overlap[src_indices]
+            tgt_keypts, tgt_features, tgt_overlap = tgt_keypts[tgt_indices], tgt_features[tgt_indices], tgt_overlap[tgt_indices]
+            src_sampled_indices, tgt_sampled_indices = src_indices, tgt_indices
+        elif not isinstance(self.num_node, str):
             if src_keypts.size(0) > self.num_node:
                 idx = torch.randperm(src_keypts.size(0), device=src_keypts.device)[:self.num_node]
                 src_keypts, src_features, src_overlap = src_keypts[idx], src_features[idx], src_overlap[idx]
+                src_sampled_indices = src_sampled_indices[idx]
             if tgt_keypts.size(0) > self.num_node:
                 idx = torch.randperm(tgt_keypts.size(0), device=tgt_keypts.device)[:self.num_node]
                 tgt_keypts, tgt_features, tgt_overlap = tgt_keypts[idx], tgt_features[idx], tgt_overlap[idx]
+                tgt_sampled_indices = tgt_sampled_indices[idx]
         return RegistrationPair(
             src_keypoints=src_keypts[None],
             tgt_keypoints=tgt_keypts[None],
@@ -332,6 +366,10 @@ class ThreeDLoMatchLoader(data.Dataset):
             tgt_ray_bundle=self._ray_bundle(scene, tgt_id, src_keypts.device),
             gt_transform=gt_trans[None],
             pair_id=f"{scene}@cloud_bin_{src_id}_cloud_bin_{tgt_id}",
+            src_sampled_indices=src_sampled_indices,
+            tgt_sampled_indices=tgt_sampled_indices,
+            src_original_count=src_original_count,
+            tgt_original_count=tgt_original_count,
         )
 
 
