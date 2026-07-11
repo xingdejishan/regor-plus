@@ -7,6 +7,8 @@ Each JSON configuration has a strict top-level `memory_graph` section. Its schem
 ## Archives and evaluation
 
 - The cached R1 pose is a permanent round-0 raw parent.
+- Its cached correspondences are mapped to fixed top-K candidate IDs before round 1; their posterior, relation edges, and non-improvement basin state initialize the search memory.
+- Each cache record carries and validates pair ID, descriptor, seed, R1 settings, inlier threshold, and a deterministic configuration fingerprint.
 - Every SVD pose is independently verified and permanently retained as a raw parent.
 - TLS only creates a refinement child. A child enters the post-refinement archive only if it stays in the configured SE(3) trust region and improves evidence score over its parent.
 - Selection is over the union of raw parents and accepted children.
@@ -44,15 +46,17 @@ The coverage term is deliberately `|V(S)| / |V(P)|`. The inverse would grow for 
 | `memory_min_coverage`, `memory_coverage_voxel_size` | Global source coverage threshold and voxel size | 0.002, 0.10 m | [0,1], >0 | 32-point support cannot satisfy a local-normalized 0.2 threshold; ablate voxel and threshold | config, signature |
 | `memory_cross_group_voxel_size`, `memory_min_cross_group_agreement` | Source grouping and cross-group agreement | 0.30 m, 0.50 | >0, [0,1] | Rejects one-local-region supports without cross-region rigidity evidence | config, signature |
 | `memory_hypotheses_per_round`, `memory_max_rounds`, `memory_prosac_initial_fraction`, `memory_prosac_growth` | Search budget and prefix schedule | 24, 8, 0.20, 0.15 | >=1, >=1, (0,1], >=0 | Required iteration/budget ablation | config, search |
+| `memory_max_sampling_attempts`, `memory_fixed_budget_mode` | Uniform valid-raw sampling-attempt cap and fixed-round ablation mode | 96, true | >=H, boolean | Main ablations run H valid raw targets for every T round and disable early stop; exhausted attempts are logged | config, search |
 | `memory_inlier_threshold`, `memory_tls_threshold`, `memory_tls_iters` | Verification and TLS | 0.10 m, 0.10 m, 3 | >0, >0, >=0 | Must match evaluation scale | config, refinement |
 | `memory_refine_trust_rotation_deg`, `memory_refine_trust_translation`, `memory_refine_min_score_improvement` | Child acceptance trust region and evidence gain | 15 deg, 0.30 m, 0.01 | >0, >0, >=0 | Prevents refinement from replacing a valid raw parent | config, child acceptance |
 | `memory_lambda_inlier`, `memory_lambda_error`, `memory_lambda_coverage` | Pose score `J_t` | all 1 | >=0 | Avoids selecting on inlier count alone | config, pose score |
-| `memory_lambda_basin_negative`, `memory_lambda_basin_positive`, `memory_basin_presearch_penalty` | Post-pose basin score and pre-SVD failure-signature penalty | 1, 1, 1 | >=0 | Failed basins alter support expansion before TLS | config, basin/support objective |
+| `memory_lambda_basin_nonimproving`, `memory_lambda_basin_positive`, `memory_basin_presearch_penalty`, `memory_basin_presearch_min_support_overlap` | Post-pose non-improvement score and pre-SVD overlap-constrained penalty | 1, 1, 1, 0.50 | >=0, >=0, >=0, [0,1] | This is non-improvement memory, not failure memory; pre-SVD suppression requires both signature and candidate-support overlap | config, basin/support objective |
 | `memory_basin_rotation_deg`, `memory_basin_translation`, `memory_basin_max`, `memory_basin_signature_momentum`, `memory_basin_signature_similarity` | Pose hashing and signature cache | 5 deg, 0.10 m, 256, 0.90, 0.90 | >0, >0, >=1, [0,1), [0,1] | Balances duplicate suppression and false merges | config, basin cache |
 | `memory_patience`, `memory_score_epsilon`, `memory_pose_epsilon_rotation_deg`, `memory_pose_epsilon_translation_multiplier`, `memory_novelty_threshold`, `memory_delta_threshold` | Joint stopping | 3, 0.005, 0.2 deg, 0.5, 0.1, 0.01 | non-negative; novelty in [0,1] | Basin-disabled ablations omit novelty from stopping | config, search |
 | `memory_strong_stop_min_inliers`, `memory_strong_stop_inlier_fraction`, `memory_strong_stop_error_ratio`, `memory_strong_stop_coverage` | Strong-stop confidence | 30, 0.02, 0.75, 0.20 | >=3, (0,1], >0, [0,1] | Stops only on wide, accurate consensus | config, strong stop |
 | `memory_use_reliability`, `memory_use_relation_history`, `memory_use_basin` | Clean three-layer ablations | true, true, true | boolean | Disabled layers neither update nor affect their downstream weights/query/stop paths; static geometric graph remains common | config, ablation script |
 | `memory_require_r1_cache` | Fair fixed-R1 repair evaluation | true | must be true | Missing cache is an error; no R1 fallback is allowed | config, experiment entry |
+| `memory_r1_mapping_radius`, `memory_r1_min_mapping_ratio`, `memory_r1_low_confidence_inlier_ratio`, `memory_r1_low_confidence_error_ratio` | Cache-correspondence identity mapping and round-0 memory initialization | 1e-5 m, 0.80, 0.50, 1.00 | >0, [0,1], [0,1], >0 | R1 support must map to the fixed top-K table before round 1; cache mismatch or insufficient mapping stops the run | config, R1 initialization |
 
 ## Verification checklist
 
@@ -63,3 +67,4 @@ The coverage term is deliberately `|V(S)| / |V(P)|`. The inverse would grow for 
 - [x] Reliability and basin ablations disable their update and every downstream use.
 - [x] Signature tests cover global coverage, plane degeneracy, and pre-search basin suppression.
 - [x] `tests/test_correspondence_memory.py` covers raw-parent survival and future-round audit leakage.
+- [x] `scripts/run_memory_graph_ablations.py` also runs `repeated_regor_equal_budget` with the same cached R1 and H/T settings; pass `--no-include-repeated-regor` only when that control is intentionally excluded.

@@ -1,12 +1,15 @@
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
 import random
+import subprocess
 import sys
 import time
 from pathlib import Path
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -61,6 +64,28 @@ def r1_cache_path(cache_dir, pair_index):
     return Path(cache_dir) / f"pair_{pair_index:06d}.pt"
 
 
+@lru_cache(maxsize=1)
+def source_revision():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def r1_cache_metadata(pair, config):
+    settings = {
+        "pair_id": pair.pair_id,
+        "descriptor": str(config.descriptor),
+        "seed": int(getattr(config, "seed", 51)),
+        "r1_knn": int(config.r1_knn),
+        "r1_sampling": int(config.r1_sampling),
+        "inlier_threshold": float(config.inlier_threshold),
+        "commit": source_revision(),
+    }
+    fingerprint = hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()
+    return {**settings, "fingerprint": fingerprint}
+
+
 def load_or_run_r1(pair, pair_index, matcher, regenerator, config):
     cache_dir = getattr(config, "r1_cache_dir", "")
     if cache_dir:
@@ -89,11 +114,12 @@ def load_or_run_r1(pair, pair_index, matcher, regenerator, config):
             "pose": r1.pose.detach().cpu(),
             "src_corr": r1.src_corr.detach().cpu(),
             "tgt_corr": r1.tgt_corr.detach().cpu(),
+            "metadata": r1_cache_metadata(pair, config),
         }, path)
     return r1
 
 
-def load_required_r1_pose(pair, pair_index, config):
+def load_required_r1_cache(pair, pair_index, config):
     cache_dir = getattr(config, "r1_cache_dir", "")
     if not cache_dir:
         raise ValueError("memory_graph requires a non-empty r1_cache_dir with fixed R1 outputs.")
@@ -101,12 +127,18 @@ def load_required_r1_pose(pair, pair_index, config):
     if not path.exists():
         raise FileNotFoundError(f"memory_graph requires fixed R1 cache entry: {path}")
     payload = torch.load(path, map_location=pair.src_keypoints.device, weights_only=True)
-    if "pose" not in payload:
-        raise KeyError(f"R1 cache entry {path} does not contain pose.")
+    if not {"pose", "src_corr", "tgt_corr", "metadata"}.issubset(payload):
+        raise KeyError(f"R1 cache entry {path} must contain pose, src_corr, tgt_corr, and metadata.")
+    if payload["metadata"] != r1_cache_metadata(pair, config):
+        raise ValueError(f"R1 cache metadata mismatch at {path}; regenerate the fixed cache for this pair/config.")
     pose = payload["pose"].to(device=pair.src_keypoints.device, dtype=pair.src_keypoints.dtype)
     if pose.shape != (1, 4, 4):
         raise ValueError(f"R1 cache pose at {path} must have shape (1, 4, 4), got {tuple(pose.shape)}.")
-    return pose
+    return {
+        "pose": pose,
+        "src_corr": payload["src_corr"].to(device=pair.src_keypoints.device, dtype=pair.src_keypoints.dtype),
+        "tgt_corr": payload["tgt_corr"].to(device=pair.tgt_keypoints.device, dtype=pair.tgt_keypoints.dtype),
+    }
 
 
 def audit_archive_prefix(archive, audits, round_id, rotation_threshold, translation_threshold, re_key, te_key, success_key):
@@ -349,9 +381,9 @@ def run_memory_graph_experiment(config, memory_config):
             load_started = time.perf_counter()
             pair = loader.get_pair(index)
             load_time = time.perf_counter() - load_started
-            r1_pose = load_required_r1_pose(pair, index, config)
+            r1_cache = load_required_r1_cache(pair, index, config)
             model_started = time.perf_counter()
-            result = registrar.run(pair.src_keypoints, pair.tgt_keypoints, pair.src_features, pair.tgt_features, initial_pose=r1_pose)
+            result = registrar.run(pair.src_keypoints, pair.tgt_keypoints, pair.src_features, pair.tgt_features, initial_pose=r1_cache["pose"], initial_src_corr=r1_cache["src_corr"], initial_tgt_corr=r1_cache["tgt_corr"])
             model_time = time.perf_counter() - model_started
             if result.r1_hypothesis is None:
                 raise RuntimeError("memory_graph required R1 cache but no R1 archive parent was created.")
@@ -411,6 +443,7 @@ def run_memory_graph_experiment(config, memory_config):
                 "load_time": load_time,
                 "model_time": model_time,
                 **result.memory_summary,
+                **result.r1_initialization,
             })
     for filename, rows in (("pair_results.csv", pair_rows), ("round_logs.csv", round_rows), ("candidate_logs.csv", candidate_rows)):
         if rows:

@@ -34,6 +34,7 @@ class MemorySearchResult:
     pose: torch.Tensor
     best: MemoryHypothesis | None
     r1_hypothesis: MemoryHypothesis | None
+    r1_initialization: dict
     raw_hypotheses: list
     post_refinement_hypotheses: list
     round_logs: list
@@ -200,20 +201,37 @@ class MemoryGuidedRegistration:
             "reject_reason": reject_reason,
         }
 
-    def run(self, src_points, tgt_points, src_features, tgt_features, initial_pose=None):
+    def run(self, src_points, tgt_points, src_features, tgt_features, initial_pose=None, initial_support_ids=None, initial_src_corr=None, initial_tgt_corr=None):
         if self.config.memory_require_r1_cache and initial_pose is None:
             raise ValueError("memory_graph requires the fixed R1 pose as a permanent round-0 parent.")
         memory = CorrespondenceMemory(src_points, tgt_points, src_features, tgt_features, self.config)
+        mapping = {"r1_corr_count": 0, "r1_mapped_count": 0, "r1_mapping_ratio": 0.0}
+        if initial_src_corr is not None and initial_tgt_corr is not None:
+            initial_support_ids, mapping = memory.map_cached_correspondences(initial_src_corr, initial_tgt_corr, self.config.memory_r1_mapping_radius)
+            if mapping["r1_mapping_ratio"] < self.config.memory_r1_min_mapping_ratio:
+                raise RuntimeError(f"R1 candidate mapping ratio {mapping['r1_mapping_ratio']:.3f} is below {self.config.memory_r1_min_mapping_ratio:.3f}.")
         raw_hypotheses, post_refinement_hypotheses, candidate_logs, round_logs = [], [], [], []
         next_id = 0
         r1_hypothesis = None
+        r1_initialization = {"r1_initialized": 0, "r1_low_confidence": 0, "r1_support_inlier_ratio": 0.0, "r1_support_mean_error": float("inf"), **mapping}
         if initial_pose is not None:
-            initial_support = torch.empty(0, dtype=torch.long, device=memory.device)
+            initial_support = initial_support_ids if initial_support_ids is not None else torch.empty(0, dtype=torch.long, device=memory.device)
             r1_hypothesis = self._make_hypothesis(memory, next_id, -1, 0, "r1", initial_pose, initial_pose, initial_support)
             next_id += 1
             raw_hypotheses.append(r1_hypothesis)
             post_refinement_hypotheses.append(r1_hypothesis)
             candidate_logs.append(self._candidate_log(r1_hypothesis, -1, 0.0, True, ""))
+            if initial_support.numel():
+                support_inliers = torch.isin(initial_support, r1_hypothesis.inlier_ids)
+                support_ratio = float(support_inliers.float().mean().item())
+                support_error = float(r1_hypothesis.residuals[initial_support].mean().item())
+                low_confidence = support_ratio < self.config.memory_r1_low_confidence_inlier_ratio or support_error > self.config.memory_r1_low_confidence_error_ratio * self.config.memory_inlier_threshold
+                inliers = torch.zeros(memory.count, dtype=torch.bool, device=memory.device)
+                inliers[r1_hypothesis.inlier_ids] = True
+                memory.update_pair_posterior(initial_support, inliers)
+                memory.update_relation_graph(initial_support, inliers, r1_hypothesis.residuals)
+                memory.update_basin(r1_hypothesis.pose, r1_hypothesis.support_signature, r1_hypothesis.score, not low_confidence, initial_support)
+                r1_initialization = {"r1_initialized": 1, "r1_low_confidence": int(low_confidence), "r1_support_inlier_ratio": support_ratio, "r1_support_mean_error": support_error, **mapping}
         best = max(post_refinement_hypotheses, key=lambda item: item.score) if post_refinement_hypotheses else None
         if r1_hypothesis is not None:
             r1_coverage = self._coverage(memory, r1_hypothesis.inlier_ids)
@@ -240,11 +258,13 @@ class MemoryGuidedRegistration:
             best_before_round = best
             ranked = torch.argsort(memory.rank(), descending=True)
             current_round, novel = [], 0
-            for hypothesis_index in range(self.config.memory_hypotheses_per_round):
-                seed = self._prosac_seed(ranked, round_id - 1, hypothesis_index)
+            sampling_attempts, raw_generated = 0, 0
+            while raw_generated < self.config.memory_hypotheses_per_round and sampling_attempts < self.config.memory_max_sampling_attempts:
+                seed = self._prosac_seed(ranked, round_id - 1, sampling_attempts)
+                sampling_attempts += 1
                 support = memory.expand_support(seed)
                 support_objective = float(memory.support_objective(support).item())
-                presearch_basin_penalty = float(memory.presearch_basin_penalty(memory.support_signature(support)).item())
+                presearch_basin_penalty = float(memory.presearch_basin_penalty(memory.support_signature(support), support).item())
                 if memory.is_degenerate(support):
                     candidate_logs.append({
                         "round_id": round_id,
@@ -266,6 +286,7 @@ class MemoryGuidedRegistration:
                 raw_hypotheses.append(raw)
                 post_refinement_hypotheses.append(raw)
                 current_round.append(raw)
+                raw_generated += 1
                 raw_log = self._candidate_log(raw, seed, support_objective, True, "")
                 raw_log["presearch_basin_penalty"] = presearch_basin_penalty
                 candidate_logs.append(raw_log)
@@ -291,7 +312,27 @@ class MemoryGuidedRegistration:
                     candidate_logs.append(child_log)
             if not current_round:
                 stale += 1
-                if stale >= self.config.memory_patience:
+                round_logs.append({
+                    "round_id": round_id,
+                    "best_hypothesis_id": best.hypothesis_id,
+                    "best_score": best.score,
+                    "round_hypothesis_id": best.hypothesis_id,
+                    "round_score": float("-inf"),
+                    "raw_candidate_count": 0,
+                    "accepted_child_count": 0,
+                    "sampling_attempt_count": sampling_attempts,
+                    "sampling_budget_exhausted": 1,
+                    "inlier_count": int(best.inlier_ids.numel()),
+                    "coverage": self._coverage(memory, best.inlier_ids),
+                    "best_coverage": self._coverage(memory, best.inlier_ids),
+                    "duplicate_basin_rate": None,
+                    "novelty": None,
+                    "posterior_delta": 0.0,
+                    "graph_delta": 0.0,
+                    "basin_count": len(memory.basins),
+                    "stale_rounds": stale,
+                })
+                if not self.config.memory_fixed_budget_mode and stale >= self.config.memory_patience:
                     break
                 continue
             current = max(current_round, key=lambda item: item.score)
@@ -304,7 +345,7 @@ class MemoryGuidedRegistration:
             inliers[current.inlier_ids] = True
             posterior_delta = memory.update_pair_posterior(current.support_ids, inliers)
             graph_delta = memory.update_relation_graph(current.support_ids, inliers, current.residuals)
-            memory.update_basin(current.pose, current.support_signature, current.score, improved)
+            memory.update_basin(current.pose, current.support_signature, current.score, improved, current.support_ids)
             memory.compress()
             current_coverage = self._coverage(memory, current.inlier_ids)
             best_coverage = self._coverage(memory, best.inlier_ids)
@@ -319,6 +360,8 @@ class MemoryGuidedRegistration:
                 "round_score": current.score,
                 "raw_candidate_count": sum(item.stage == "raw" for item in current_round),
                 "accepted_child_count": sum(item.stage == "refinement_child" for item in current_round),
+                "sampling_attempt_count": sampling_attempts,
+                "sampling_budget_exhausted": int(raw_generated < self.config.memory_hypotheses_per_round),
                 "inlier_count": int(current.inlier_ids.numel()),
                 "coverage": current_coverage,
                 "best_coverage": best_coverage,
@@ -329,7 +372,7 @@ class MemoryGuidedRegistration:
                 "basin_count": len(memory.basins),
                 "stale_rounds": stale,
             })
-            if self._strong_stop(best, best_coverage):
+            if not self.config.memory_fixed_budget_mode and self._strong_stop(best, best_coverage):
                 break
             converged = (
                 stale >= self.config.memory_patience
@@ -340,9 +383,9 @@ class MemoryGuidedRegistration:
             )
             if self.config.memory_use_basin:
                 converged = converged and novelty < self.config.memory_novelty_threshold
-            if converged:
+            if not self.config.memory_fixed_budget_mode and converged:
                 break
         if best is None:
             identity = torch.eye(4, dtype=memory.dtype, device=memory.device)[None]
-            return MemorySearchResult(identity, None, r1_hypothesis, raw_hypotheses, post_refinement_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)
-        return MemorySearchResult(best.pose, best, r1_hypothesis, raw_hypotheses, post_refinement_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)
+            return MemorySearchResult(identity, None, r1_hypothesis, r1_initialization, raw_hypotheses, post_refinement_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)
+        return MemorySearchResult(best.pose, best, r1_hypothesis, r1_initialization, raw_hypotheses, post_refinement_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)

@@ -8,9 +8,10 @@ import torch
 @dataclass
 class BasinRecord:
     n_positive: float
-    n_negative: float
+    n_nonimproving: float
     best_score: float
     signature_mean: torch.Tensor
+    support_ids: torch.Tensor
 
 
 class CorrespondenceMemory:
@@ -32,6 +33,7 @@ class CorrespondenceMemory:
         self.basins = OrderedDict()
         self._negative_basin_signatures = torch.empty((0, 5), dtype=self.dtype, device=self.device)
         self._negative_basin_weights = torch.empty(0, dtype=self.dtype, device=self.device)
+        self._negative_basin_supports = []
 
     @staticmethod
     def _points(points):
@@ -101,13 +103,18 @@ class CorrespondenceMemory:
 
     def graph_quality(self):
         quality = torch.zeros(self.count, dtype=self.dtype, device=self.device)
-        if self.edge_rows.numel() == 0 or not self.config.memory_use_relation_history:
+        if self.edge_rows.numel() == 0:
             return quality
-        weights = torch.relu(self.edge_weight())
-        quality.index_add_(0, self.edge_rows, weights)
+        static = torch.zeros_like(quality)
+        static.index_add_(0, self.edge_rows, self.static_geometry)
         degree = torch.zeros_like(quality)
-        degree.index_add_(0, self.edge_rows, torch.ones_like(weights))
-        return quality / torch.clamp_min(degree, 1.0)
+        degree.index_add_(0, self.edge_rows, torch.ones_like(self.static_geometry))
+        static = static / torch.clamp_min(degree, 1.0)
+        if not self.config.memory_use_relation_history:
+            return static
+        history_weight = self.config.memory_lambda_edge_success * torch.log1p(self.edge_success) - self.config.memory_lambda_edge_failure * torch.log1p(self.edge_failure)
+        quality.index_add_(0, self.edge_rows, history_weight)
+        return static + quality / torch.clamp_min(degree, 1.0)
 
     def rank(self):
         reliability = self.reliability
@@ -164,14 +171,20 @@ class CorrespondenceMemory:
             or signature[4] < self.config.memory_min_cross_group_agreement
         )
 
-    def presearch_basin_penalty(self, signature):
+    def presearch_basin_penalty(self, signature, support):
         if not self.config.memory_use_basin or self._negative_basin_signatures.numel() == 0:
             return torch.zeros((), dtype=self.dtype, device=self.device)
         normalized_signature = signature / torch.clamp_min(torch.linalg.norm(signature), 1e-8)
         normalized_history = self._negative_basin_signatures / torch.clamp_min(torch.linalg.norm(self._negative_basin_signatures, dim=1, keepdim=True), 1e-8)
         similarity = normalized_history @ normalized_signature
-        repeated = similarity >= self.config.memory_basin_signature_similarity
-        return torch.max(torch.where(repeated, similarity * self._negative_basin_weights, torch.zeros_like(similarity)))
+        repeated = torch.where(similarity >= self.config.memory_basin_signature_similarity)[0]
+        penalties = []
+        for index in repeated.tolist():
+            historical_support = self._negative_basin_supports[index]
+            overlap = torch.isin(support, historical_support).sum() / max(1, min(int(support.numel()), int(historical_support.numel())))
+            if overlap >= self.config.memory_basin_presearch_min_support_overlap:
+                penalties.append(similarity[index] * self._negative_basin_weights[index])
+        return torch.stack(penalties).max() if penalties else torch.zeros((), dtype=self.dtype, device=self.device)
 
     def support_objective(self, support, candidate_score=None):
         candidate_score = self.rank() if candidate_score is None else candidate_score
@@ -188,7 +201,7 @@ class CorrespondenceMemory:
             node_term
             + self.config.memory_lambda_edge * edge_term
             - self.config.memory_lambda_degeneracy * self.degeneracy_penalty(support)
-            - self.config.memory_basin_presearch_penalty * self.presearch_basin_penalty(signature)
+            - self.config.memory_basin_presearch_penalty * self.presearch_basin_penalty(signature, support)
         )
 
     def expand_support(self, seed):
@@ -232,6 +245,23 @@ class CorrespondenceMemory:
     def correspondence_points(self, candidate_ids):
         return self.src_points[self.src_indices[candidate_ids]][None], self.tgt_points[self.tgt_indices[candidate_ids]][None]
 
+    def map_cached_correspondences(self, src_corr, tgt_corr, radius):
+        source = self._points(src_corr)
+        target = self._points(tgt_corr)
+        if source.numel() == 0 or target.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device), {"r1_corr_count": 0, "r1_mapped_count": 0, "r1_mapping_ratio": 0.0}
+        source_distance, source_ids = torch.cdist(source, self.src_points).min(dim=1)
+        target_distance, target_ids = torch.cdist(target, self.tgt_points).min(dim=1)
+        valid = (source_distance <= radius) & (target_distance <= radius)
+        candidate_ids = []
+        for source_id, target_id in zip(source_ids[valid].tolist(), target_ids[valid].tolist()):
+            candidates = torch.where((self.src_indices == source_id) & (self.tgt_indices == target_id))[0]
+            if candidates.numel():
+                candidate_ids.append(int(candidates[0]))
+        mapped = torch.tensor(candidate_ids, dtype=torch.long, device=self.device).unique() if candidate_ids else torch.empty(0, dtype=torch.long, device=self.device)
+        count = int(source.shape[0])
+        return mapped, {"r1_corr_count": count, "r1_mapped_count": int(mapped.numel()), "r1_mapping_ratio": float(mapped.numel() / max(1, count))}
+
     def _rotation_vector(self, rotation):
         cosine = torch.clamp((torch.trace(rotation) - 1.0) * 0.5, -1.0, 1.0)
         theta = torch.acos(cosine)
@@ -267,22 +297,24 @@ class CorrespondenceMemory:
         if similarity < self.config.memory_basin_signature_similarity:
             return 0.0
         return (
-            -self.config.memory_lambda_basin_negative * math.log1p(record.n_negative)
+            -self.config.memory_lambda_basin_nonimproving * math.log1p(record.n_nonimproving)
             + self.config.memory_lambda_basin_positive * math.log1p(record.n_positive)
         )
 
     def _refresh_negative_basin_cache(self):
-        records = [record for record in self.basins.values() if record.n_negative > record.n_positive]
+        records = [record for record in self.basins.values() if record.n_nonimproving > record.n_positive]
         if not records:
             self._negative_basin_signatures = torch.empty((0, 5), dtype=self.dtype, device=self.device)
             self._negative_basin_weights = torch.empty(0, dtype=self.dtype, device=self.device)
+            self._negative_basin_supports = []
             return
         self._negative_basin_signatures = torch.stack([record.signature_mean for record in records]).to(device=self.device, dtype=self.dtype)
         self._negative_basin_weights = torch.tensor(
-            [math.log1p(record.n_negative) - math.log1p(record.n_positive) for record in records],
+            [math.log1p(record.n_nonimproving) - math.log1p(record.n_positive) for record in records],
             dtype=self.dtype,
             device=self.device,
         )
+        self._negative_basin_supports = [record.support_ids.to(device=self.device) for record in records]
 
     def update_pair_posterior(self, support, inliers):
         if not self.config.memory_use_reliability:
@@ -314,20 +346,21 @@ class CorrespondenceMemory:
         self.edge_failure.clamp_(max=self.config.memory_evidence_cap)
         return float((success.sum() + failure.sum()).item() / max(1, self.edge_rows.numel()))
 
-    def update_basin(self, pose, signature, score, improved):
+    def update_basin(self, pose, signature, score, improved, support_ids):
         if not self.config.memory_use_basin:
             return None, None
         key, record = self.basin_record(pose)
         signature = signature.detach().float().cpu()
         if record is None:
-            record = BasinRecord(0.0, 0.0, float("-inf"), signature)
+            record = BasinRecord(0.0, 0.0, float("-inf"), signature, support_ids.detach().cpu())
             self.basins[key] = record
         if improved:
             record.n_positive += 1.0
         else:
-            record.n_negative += 1.0
+            record.n_nonimproving += 1.0
         record.best_score = max(record.best_score, float(score))
         record.signature_mean = self.config.memory_basin_signature_momentum * record.signature_mean + (1.0 - self.config.memory_basin_signature_momentum) * signature
+        record.support_ids = support_ids.detach().cpu()
         self.basins.move_to_end(key)
         while len(self.basins) > self.config.memory_basin_max:
             self.basins.popitem(last=False)

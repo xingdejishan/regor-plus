@@ -112,6 +112,23 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         memory.update_relation_graph(correct[:6], inliers, residuals)
         self.assertGreater(float(memory.edge_success.sum()), 0.0)
 
+    def test_r1_correspondences_initialize_candidate_memory_before_round_one(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        r1_pose = torch.eye(4)[None]
+        r1_pose[0, :3, :3], r1_pose[0, :3, 3] = rotation, translation
+        result = MemoryGuidedRegistration(config()).run(
+            source,
+            target,
+            source_features,
+            target_features,
+            initial_pose=r1_pose,
+            initial_src_corr=source[:, :6],
+            initial_tgt_corr=target[:, :6],
+        )
+        self.assertEqual(result.r1_initialization["r1_initialized"], 1)
+        self.assertEqual(result.r1_initialization["r1_mapped_count"], 6)
+        self.assertGreater(result.round_logs[0]["inlier_count"], 0)
+
     def test_disabled_memory_layers_do_not_update_or_affect_estimation_weights(self):
         source, target, source_features, target_features, _, _ = synthetic_pair()
         memory = CorrespondenceMemory(
@@ -129,9 +146,15 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         self.assertTrue(torch.equal(memory.beta, beta_before))
         self.assertTrue(torch.equal(memory.estimation_weights(support), torch.ones_like(support, dtype=memory.dtype)))
         signature = memory.support_signature(support)
-        self.assertEqual(memory.update_basin(torch.eye(4)[None], signature, 0.0, improved=False), (None, None))
+        self.assertEqual(memory.update_basin(torch.eye(4)[None], signature, 0.0, improved=False, support_ids=support), (None, None))
         self.assertEqual(len(memory.basins), 0)
-        self.assertEqual(float(memory.presearch_basin_penalty(signature)), 0.0)
+        self.assertEqual(float(memory.presearch_basin_penalty(signature, support)), 0.0)
+
+    def test_static_graph_ranking_is_identical_with_history_disabled_before_updates(self):
+        source, target, source_features, target_features, _, _ = synthetic_pair()
+        static_only = CorrespondenceMemory(source, target, source_features, target_features, config(memory_use_relation_history=False))
+        history_enabled = CorrespondenceMemory(source, target, source_features, target_features, config(memory_use_relation_history=True))
+        self.assertTrue(torch.allclose(static_only.graph_quality(), history_enabled.graph_quality()))
 
     def test_basin_penalty_requires_matching_support_signature(self):
         source, target, source_features, target_features, _, _ = synthetic_pair()
@@ -140,9 +163,9 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         signature = memory.support_signature(support)
         objective_before = float(memory.support_objective(support))
         pose = torch.eye(4)[None]
-        memory.update_basin(pose, signature, 1.0, improved=False)
+        memory.update_basin(pose, signature, 1.0, improved=False, support_ids=support)
         self.assertLess(memory.basin_bonus(pose, signature), 0.0)
-        self.assertGreater(float(memory.presearch_basin_penalty(signature)), 0.0)
+        self.assertGreater(float(memory.presearch_basin_penalty(signature, support)), 0.0)
         self.assertLess(float(memory.support_objective(support)), objective_before)
         self.assertEqual(memory.basin_bonus(pose, torch.zeros_like(signature)), 0.0)
 
