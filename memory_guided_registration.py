@@ -213,7 +213,15 @@ class MemoryGuidedRegistration:
         raw_hypotheses, post_refinement_hypotheses, candidate_logs, round_logs = [], [], [], []
         next_id = 0
         r1_hypothesis = None
-        r1_initialization = {"r1_initialized": 0, "r1_low_confidence": 0, "r1_support_inlier_ratio": 0.0, "r1_support_mean_error": float("inf"), **mapping}
+        r1_initialization = {
+            "r1_initialized": 0,
+            "r1_low_confidence": 0,
+            "r1_support_inlier_ratio": 0.0,
+            "r1_support_mean_error": float("inf"),
+            "r1_posterior_delta": 0.0,
+            "r1_graph_delta": 0.0,
+            **mapping,
+        }
         if initial_pose is not None:
             initial_support = initial_support_ids if initial_support_ids is not None else torch.empty(0, dtype=torch.long, device=memory.device)
             r1_hypothesis = self._make_hypothesis(memory, next_id, -1, 0, "r1", initial_pose, initial_pose, initial_support)
@@ -226,12 +234,48 @@ class MemoryGuidedRegistration:
                 support_ratio = float(support_inliers.float().mean().item())
                 support_error = float(r1_hypothesis.residuals[initial_support].mean().item())
                 low_confidence = support_ratio < self.config.memory_r1_low_confidence_inlier_ratio or support_error > self.config.memory_r1_low_confidence_error_ratio * self.config.memory_inlier_threshold
-                inliers = torch.zeros(memory.count, dtype=torch.bool, device=memory.device)
+                inliers = torch.zeros(
+                    memory.count,
+                    dtype=torch.bool,
+                    device=memory.device,
+                )
                 inliers[r1_hypothesis.inlier_ids] = True
-                memory.update_pair_posterior(initial_support, inliers)
-                memory.update_relation_graph(initial_support, inliers, r1_hypothesis.residuals)
-                memory.update_basin(r1_hypothesis.pose, r1_hypothesis.support_signature, r1_hypothesis.score, not low_confidence, initial_support)
-                r1_initialization = {"r1_initialized": 1, "r1_low_confidence": int(low_confidence), "r1_support_inlier_ratio": support_ratio, "r1_support_mean_error": support_error, **mapping}
+                if low_confidence:
+                    posterior_delta = 0.0
+                    graph_delta = 0.0
+                    memory.update_basin(
+                        r1_hypothesis.pose,
+                        r1_hypothesis.support_signature,
+                        r1_hypothesis.score,
+                        improved=False,
+                        support_ids=initial_support,
+                    )
+                else:
+                    posterior_delta = memory.update_pair_posterior(
+                        initial_support,
+                        inliers,
+                    )
+                    graph_delta = memory.update_relation_graph(
+                        initial_support,
+                        inliers,
+                        r1_hypothesis.residuals,
+                    )
+                    memory.update_basin(
+                        r1_hypothesis.pose,
+                        r1_hypothesis.support_signature,
+                        r1_hypothesis.score,
+                        improved=True,
+                        support_ids=initial_support,
+                    )
+                r1_initialization = {
+                    "r1_initialized": 1,
+                    "r1_low_confidence": int(low_confidence),
+                    "r1_support_inlier_ratio": support_ratio,
+                    "r1_support_mean_error": support_error,
+                    "r1_posterior_delta": posterior_delta,
+                    "r1_graph_delta": graph_delta,
+                    **mapping,
+                }
         best = max(post_refinement_hypotheses, key=lambda item: item.score) if post_refinement_hypotheses else None
         if r1_hypothesis is not None:
             r1_coverage = self._coverage(memory, r1_hypothesis.inlier_ids)

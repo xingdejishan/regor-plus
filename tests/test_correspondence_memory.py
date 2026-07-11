@@ -1,6 +1,7 @@
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -128,6 +129,46 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         self.assertEqual(result.r1_initialization["r1_initialized"], 1)
         self.assertEqual(result.r1_initialization["r1_mapped_count"], 6)
         self.assertGreater(result.round_logs[0]["inlier_count"], 0)
+
+    def test_low_confidence_r1_does_not_add_positive_memory(self):
+        class CapturingMemory(CorrespondenceMemory):
+            instance = None
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                type(self).instance = self
+                self.alpha_before = self.alpha.clone()
+                self.beta_before = self.beta.clone()
+                self.success_before = self.edge_success.clone()
+                self.failure_before = self.edge_failure.clone()
+
+            def is_degenerate(self, support):
+                return True
+
+        source, target, source_features, target_features, _, _ = synthetic_pair()
+        r1_pose = torch.eye(4)[None]
+        with patch("memory_guided_registration.CorrespondenceMemory", CapturingMemory):
+            result = MemoryGuidedRegistration(config(
+                memory_max_sampling_attempts=6,
+                memory_r1_low_confidence_inlier_ratio=1.0,
+            )).run(
+                source,
+                target,
+                source_features,
+                target_features,
+                initial_pose=r1_pose,
+                initial_src_corr=source[:, :6],
+                initial_tgt_corr=target[:, :6],
+            )
+        memory = CapturingMemory.instance
+        self.assertTrue(torch.equal(memory.alpha, memory.alpha_before))
+        self.assertTrue(torch.equal(memory.beta, memory.beta_before))
+        self.assertTrue(torch.equal(memory.edge_success, memory.success_before))
+        self.assertTrue(torch.equal(memory.edge_failure, memory.failure_before))
+        self.assertEqual(memory.basins[next(iter(memory.basins))].n_nonimproving, 1.0)
+        self.assertEqual(result.r1_initialization["r1_low_confidence"], 1)
+        self.assertEqual(result.r1_initialization["r1_posterior_delta"], 0.0)
+        self.assertEqual(result.r1_initialization["r1_graph_delta"], 0.0)
 
     def test_disabled_memory_layers_do_not_update_or_affect_estimation_weights(self):
         source, target, source_features, target_features, _, _ = synthetic_pair()

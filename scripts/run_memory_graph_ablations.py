@@ -13,7 +13,7 @@ from test_3DLoMatch import run_experiment
 
 
 VARIANTS = {
-    "no_memory": {"memory_use_reliability": False, "memory_use_relation_history": False, "memory_use_basin": False},
+    "equal_budget_no_history": {"memory_use_reliability": False, "memory_use_relation_history": False, "memory_use_basin": False},
     "posterior": {"memory_use_reliability": True, "memory_use_relation_history": False, "memory_use_basin": False},
     "posterior_graph": {"memory_use_reliability": True, "memory_use_relation_history": True, "memory_use_basin": False},
     "posterior_basin": {"memory_use_reliability": True, "memory_use_relation_history": False, "memory_use_basin": True},
@@ -41,7 +41,10 @@ def main():
         config.iterative_ray["method"] = "repeated_regor"
         config.iterative_ray["search_max_rounds"] = config.memory_graph["memory_max_rounds"]
         config.iterative_ray["candidates_per_round"] = config.memory_graph["memory_hypotheses_per_round"]
-        config.output_dir = str(Path(args.output_root) / "repeated_regor_equal_budget")
+        config.iterative_ray["candidate_pool_multiplier"] = 1
+        config.iterative_ray["enable_adaptive_stop"] = False
+        config.iterative_ray["search_time_budget_seconds"] = 0
+        config.output_dir = str(Path(args.output_root) / "repeated_regor_ray_auxiliary")
         run_experiment(config)
 
 
