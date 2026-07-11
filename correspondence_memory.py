@@ -20,14 +20,18 @@ class CorrespondenceMemory:
         self.tgt_points = self._points(tgt_points)
         self.device = self.src_points.device
         self.dtype = self.src_points.dtype
-        self.src_indices, self.tgt_indices, self.descriptor_score = self._build_candidates(src_features, tgt_features)
+        self.src_indices, self.tgt_indices, self.descriptor_score, self.topk_descriptor_scores = self._build_candidates(src_features, tgt_features)
         self.count = int(self.src_indices.numel())
+        self.topk = int(self.topk_descriptor_scores.shape[1])
         self.alpha = config.memory_alpha0 + config.memory_descriptor_prior * self.descriptor_score
         self.beta = torch.full_like(self.alpha, float(config.memory_beta0))
+        self.source_voxel_count = max(1, int(torch.unique(torch.floor(self.src_points / config.memory_coverage_voxel_size).long(), dim=0).shape[0]))
         self.edge_rows, self.edge_cols, self.static_geometry, self.row_ptr = self._build_relation_graph()
         self.edge_success = torch.zeros_like(self.static_geometry)
         self.edge_failure = torch.zeros_like(self.static_geometry)
         self.basins = OrderedDict()
+        self._negative_basin_signatures = torch.empty((0, 5), dtype=self.dtype, device=self.device)
+        self._negative_basin_weights = torch.empty(0, dtype=self.dtype, device=self.device)
 
     @staticmethod
     def _points(points):
@@ -47,11 +51,11 @@ class CorrespondenceMemory:
         flat = values.reshape(-1)
         minimum, maximum = flat.min(), flat.max()
         normalized = (flat - minimum) / torch.clamp_min(maximum - minimum, 1e-8)
-        return source.reshape(-1), indices.reshape(-1), normalized
+        return source.reshape(-1), indices.reshape(-1), normalized, values
 
     def _build_relation_graph(self):
         source_count = int(self.src_points.shape[0])
-        topk = min(int(self.config.memory_topk), int(self.tgt_points.shape[0]))
+        topk = self.topk
         if source_count < 2 or self.count == 0:
             empty_long = torch.empty(0, dtype=torch.long, device=self.device)
             return empty_long, empty_long, torch.empty(0, dtype=self.dtype, device=self.device), torch.zeros(self.count + 1, dtype=torch.long, device=self.device)
@@ -82,8 +86,15 @@ class CorrespondenceMemory:
         return edge_rows, edge_cols, static, row_ptr
 
     @property
-    def reliability(self):
+    def posterior_reliability(self):
         return self.alpha / torch.clamp_min(self.alpha + self.beta, 1e-8)
+
+    @property
+    def reliability(self):
+        return self.posterior_reliability if self.config.memory_use_reliability else torch.ones(self.count, dtype=self.dtype, device=self.device)
+
+    def estimation_weights(self, candidate_ids):
+        return self.reliability[candidate_ids]
 
     def edge_weight(self):
         return self.static_geometry + self.config.memory_lambda_edge_success * torch.log1p(self.edge_success) - self.config.memory_lambda_edge_failure * torch.log1p(self.edge_failure)
@@ -110,28 +121,57 @@ class CorrespondenceMemory:
 
     def support_signature(self, support):
         if support.numel() == 0:
-            return torch.zeros(3, dtype=self.dtype, device=self.device)
+            return torch.zeros(5, dtype=self.dtype, device=self.device)
         points = self.src_points[self.src_indices[support]]
-        descriptor_probability = torch.softmax(self.descriptor_score[support], dim=0)
-        ambiguity = -torch.sum(descriptor_probability * torch.log(torch.clamp_min(descriptor_probability, 1e-8))) / math.log(max(2, int(support.numel())))
+        source_ids = torch.unique(self.src_indices[support])
+        descriptor_probability = torch.softmax(self.topk_descriptor_scores[source_ids] / self.config.memory_signature_entropy_temperature, dim=1)
+        descriptor_entropy = -torch.sum(descriptor_probability * torch.log(torch.clamp_min(descriptor_probability, 1e-8)), dim=1) / math.log(max(2, self.topk))
+        ambiguity = descriptor_entropy.mean()
         centered = points - points.mean(dim=0, keepdim=True)
         covariance = centered.transpose(0, 1) @ centered / max(1, points.shape[0])
         eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
-        eigen_probability = eigenvalues / torch.clamp_min(eigenvalues.sum(), 1e-8)
-        eigen_entropy = -torch.sum(eigen_probability * torch.log(torch.clamp_min(eigen_probability, 1e-8))) / math.log(3.0)
+        lambda12 = eigenvalues[0] / torch.clamp_min(eigenvalues[1], 1e-8)
+        lambda13 = eigenvalues[0] / torch.clamp_min(eigenvalues[2], 1e-8)
         voxels = torch.floor(points / self.config.memory_coverage_voxel_size).long()
-        coverage = torch.unique(voxels, dim=0).shape[0] / max(1, points.shape[0])
-        return torch.stack([ambiguity, eigen_entropy, torch.as_tensor(coverage, dtype=self.dtype, device=self.device)])
+        coverage = torch.as_tensor(torch.unique(voxels, dim=0).shape[0] / self.source_voxel_count, dtype=self.dtype, device=self.device)
+        source_groups = torch.floor(points / self.config.memory_cross_group_voxel_size).long()
+        source_distance = torch.cdist(points, points)
+        target_points = self.tgt_points[self.tgt_indices[support]]
+        target_distance = torch.cdist(target_points, target_points)
+        compatibility = torch.exp(-((source_distance - target_distance) ** 2) / (2.0 * self.config.memory_sigma_g ** 2))
+        upper = torch.triu(torch.ones_like(compatibility, dtype=torch.bool), diagonal=1)
+        cross_group = upper & torch.any(source_groups[:, None] != source_groups[None], dim=-1)
+        cross_group_agreement = compatibility[cross_group].mean() if bool(cross_group.any()) else torch.zeros((), dtype=self.dtype, device=self.device)
+        return torch.stack([ambiguity, lambda12, lambda13, coverage, cross_group_agreement])
 
     def degeneracy_penalty(self, support):
         signature = self.support_signature(support)
-        return torch.relu(torch.as_tensor(self.config.memory_min_eigen_entropy, dtype=self.dtype, device=self.device) - signature[1]) + torch.relu(torch.as_tensor(self.config.memory_min_coverage, dtype=self.dtype, device=self.device) - signature[2])
+        return (
+            torch.relu(torch.as_tensor(self.config.memory_min_lambda12_ratio, dtype=self.dtype, device=self.device) - signature[1])
+            + torch.relu(torch.as_tensor(self.config.memory_min_lambda13_ratio, dtype=self.dtype, device=self.device) - signature[2])
+            + torch.relu(torch.as_tensor(self.config.memory_min_coverage, dtype=self.dtype, device=self.device) - signature[3])
+            + torch.relu(torch.as_tensor(self.config.memory_min_cross_group_agreement, dtype=self.dtype, device=self.device) - signature[4])
+        )
 
     def is_degenerate(self, support):
         if support.numel() < self.config.memory_support_min:
             return True
         signature = self.support_signature(support)
-        return bool(signature[1] < self.config.memory_min_eigen_entropy or signature[2] < self.config.memory_min_coverage)
+        return bool(
+            signature[1] < self.config.memory_min_lambda12_ratio
+            or signature[2] < self.config.memory_min_lambda13_ratio
+            or signature[3] < self.config.memory_min_coverage
+            or signature[4] < self.config.memory_min_cross_group_agreement
+        )
+
+    def presearch_basin_penalty(self, signature):
+        if not self.config.memory_use_basin or self._negative_basin_signatures.numel() == 0:
+            return torch.zeros((), dtype=self.dtype, device=self.device)
+        normalized_signature = signature / torch.clamp_min(torch.linalg.norm(signature), 1e-8)
+        normalized_history = self._negative_basin_signatures / torch.clamp_min(torch.linalg.norm(self._negative_basin_signatures, dim=1, keepdim=True), 1e-8)
+        similarity = normalized_history @ normalized_signature
+        repeated = similarity >= self.config.memory_basin_signature_similarity
+        return torch.max(torch.where(repeated, similarity * self._negative_basin_weights, torch.zeros_like(similarity)))
 
     def support_objective(self, support, candidate_score=None):
         candidate_score = self.rank() if candidate_score is None else candidate_score
@@ -143,7 +183,13 @@ class CorrespondenceMemory:
             edge_term = self.edge_weight()[edge_ids[induced]].mean() if bool(induced.any()) else torch.zeros((), dtype=self.dtype, device=self.device)
         else:
             edge_term = torch.zeros((), dtype=self.dtype, device=self.device)
-        return node_term + self.config.memory_lambda_edge * edge_term - self.config.memory_lambda_degeneracy * self.degeneracy_penalty(support)
+        signature = self.support_signature(support)
+        return (
+            node_term
+            + self.config.memory_lambda_edge * edge_term
+            - self.config.memory_lambda_degeneracy * self.degeneracy_penalty(support)
+            - self.config.memory_basin_presearch_penalty * self.presearch_basin_penalty(signature)
+        )
 
     def expand_support(self, seed):
         support = [int(seed)]
@@ -225,8 +271,23 @@ class CorrespondenceMemory:
             + self.config.memory_lambda_basin_positive * math.log1p(record.n_positive)
         )
 
+    def _refresh_negative_basin_cache(self):
+        records = [record for record in self.basins.values() if record.n_negative > record.n_positive]
+        if not records:
+            self._negative_basin_signatures = torch.empty((0, 5), dtype=self.dtype, device=self.device)
+            self._negative_basin_weights = torch.empty(0, dtype=self.dtype, device=self.device)
+            return
+        self._negative_basin_signatures = torch.stack([record.signature_mean for record in records]).to(device=self.device, dtype=self.dtype)
+        self._negative_basin_weights = torch.tensor(
+            [math.log1p(record.n_negative) - math.log1p(record.n_positive) for record in records],
+            dtype=self.dtype,
+            device=self.device,
+        )
+
     def update_pair_posterior(self, support, inliers):
-        previous = self.reliability.clone()
+        if not self.config.memory_use_reliability:
+            return 0.0
+        previous = self.posterior_reliability.clone()
         self.alpha.mul_(self.config.memory_forgetting)
         self.beta.mul_(self.config.memory_forgetting)
         self.alpha[inliers] += self.config.memory_eta_positive
@@ -235,7 +296,7 @@ class CorrespondenceMemory:
             self.beta[support_failures] += self.config.memory_eta_negative
         self.alpha.clamp_(max=self.config.memory_evidence_cap)
         self.beta.clamp_(max=self.config.memory_evidence_cap)
-        return float(torch.mean(torch.abs(self.reliability - previous)).item())
+        return float(torch.mean(torch.abs(self.posterior_reliability - previous)).item())
 
     def update_relation_graph(self, support, inliers, residuals):
         if self.edge_rows.numel() == 0 or not self.config.memory_use_relation_history:
@@ -254,6 +315,8 @@ class CorrespondenceMemory:
         return float((success.sum() + failure.sum()).item() / max(1, self.edge_rows.numel()))
 
     def update_basin(self, pose, signature, score, improved):
+        if not self.config.memory_use_basin:
+            return None, None
         key, record = self.basin_record(pose)
         signature = signature.detach().float().cpu()
         if record is None:
@@ -268,10 +331,11 @@ class CorrespondenceMemory:
         self.basins.move_to_end(key)
         while len(self.basins) > self.config.memory_basin_max:
             self.basins.popitem(last=False)
+        self._refresh_negative_basin_cache()
         return key, record
 
     def compress(self):
-        if self.edge_success.numel():
+        if self.config.memory_use_relation_history and self.edge_success.numel():
             weak = torch.abs(self.edge_success - self.edge_failure) < self.config.memory_compress_epsilon
             self.edge_success[weak] = 0.0
             self.edge_failure[weak] = 0.0

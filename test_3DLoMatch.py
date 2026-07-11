@@ -93,6 +93,22 @@ def load_or_run_r1(pair, pair_index, matcher, regenerator, config):
     return r1
 
 
+def load_required_r1_pose(pair, pair_index, config):
+    cache_dir = getattr(config, "r1_cache_dir", "")
+    if not cache_dir:
+        raise ValueError("memory_graph requires a non-empty r1_cache_dir with fixed R1 outputs.")
+    path = r1_cache_path(cache_dir, pair_index)
+    if not path.exists():
+        raise FileNotFoundError(f"memory_graph requires fixed R1 cache entry: {path}")
+    payload = torch.load(path, map_location=pair.src_keypoints.device, weights_only=True)
+    if "pose" not in payload:
+        raise KeyError(f"R1 cache entry {path} does not contain pose.")
+    pose = payload["pose"].to(device=pair.src_keypoints.device, dtype=pair.src_keypoints.dtype)
+    if pose.shape != (1, 4, 4):
+        raise ValueError(f"R1 cache pose at {path} must have shape (1, 4, 4), got {tuple(pose.shape)}.")
+    return pose
+
+
 def audit_archive_prefix(archive, audits, round_id, rotation_threshold, translation_threshold, re_key, te_key, success_key):
     eligible = [(hypothesis, audit) for hypothesis, audit in zip(archive.hypotheses, audits) if hypothesis.round_id <= round_id]
     if not eligible:
@@ -249,25 +265,26 @@ def memory_candidate_fmr(pair, result, threshold):
     return ratio, int(ratio >= 0.05), inlier_count
 
 
-def memory_prefix_audit(hypotheses, audits, round_id, rotation_threshold, translation_threshold):
+def memory_prefix_audit(hypotheses, audits, round_id, rotation_threshold, translation_threshold, re_key, te_key, success_key):
     eligible = [(hypothesis, audit) for hypothesis, audit in zip(hypotheses, audits) if hypothesis.round_id <= round_id]
     if not eligible:
         return None
     oracle_hypothesis, oracle = min(
         eligible,
         key=lambda item: (
-            max(item[1]["local_refined_re"] / rotation_threshold, item[1]["local_refined_te"] / translation_threshold),
-            item[1]["local_refined_re"],
-            item[1]["local_refined_te"],
+            max(item[1][re_key] / rotation_threshold, item[1][te_key] / translation_threshold),
+            item[1][re_key],
+            item[1][te_key],
         ),
     )
     selected_hypothesis, selected = max(eligible, key=lambda item: item[0].score)
-    success_rounds = [hypothesis.round_id for hypothesis, audit in eligible if audit["local_refined_success"]]
+    success_rounds = [hypothesis.round_id for hypothesis, audit in eligible if audit[success_key]]
     return {
         "oracle_hypothesis_id": oracle_hypothesis.hypothesis_id,
-        "cumulative_oracle_success": int(any(audit["local_refined_success"] for _, audit in eligible)),
-        "oracle_best_re": oracle["local_refined_re"],
-        "oracle_best_te": oracle["local_refined_te"],
+        "round_oracle_success": int(any(audit[success_key] and hypothesis.round_id == round_id for hypothesis, audit in eligible)),
+        "cumulative_oracle_success": int(any(audit[success_key] for _, audit in eligible)),
+        "oracle_best_re": oracle[re_key],
+        "oracle_best_te": oracle[te_key],
         "first_success_round": min(success_rounds) if success_rounds else -1,
         "selected_hypothesis_id": selected_hypothesis.hypothesis_id,
         "selected_re": selected["local_refined_re"],
@@ -276,11 +293,54 @@ def memory_prefix_audit(hypotheses, audits, round_id, rotation_threshold, transl
     }
 
 
+def memory_round_audit(result, raw_audits, post_refinement_audits, round_id, rotation_threshold, translation_threshold):
+    raw = memory_prefix_audit(
+        result.raw_hypotheses,
+        raw_audits,
+        round_id,
+        rotation_threshold,
+        translation_threshold,
+        "raw_re",
+        "raw_te",
+        "raw_success",
+    )
+    post_refinement = memory_prefix_audit(
+        result.post_refinement_hypotheses,
+        post_refinement_audits,
+        round_id,
+        rotation_threshold,
+        translation_threshold,
+        "local_refined_re",
+        "local_refined_te",
+        "local_refined_success",
+    )
+    if raw is None or post_refinement is None:
+        raise ValueError(f"No memory archive candidates available by round {round_id}.")
+    if post_refinement["cumulative_oracle_success"] < raw["cumulative_oracle_success"]:
+        raise RuntimeError("Post-refinement memory archive must retain every raw parent.")
+    return {
+        "round_raw_oracle_success": raw["round_oracle_success"],
+        "cumulative_raw_oracle_success": raw["cumulative_oracle_success"],
+        "raw_oracle_best_re": raw["oracle_best_re"],
+        "raw_oracle_best_te": raw["oracle_best_te"],
+        "first_raw_success_round": raw["first_success_round"],
+        "round_post_refinement_oracle_success": post_refinement["round_oracle_success"],
+        "cumulative_post_refinement_oracle_success": post_refinement["cumulative_oracle_success"],
+        "post_refinement_oracle_best_re": post_refinement["oracle_best_re"],
+        "post_refinement_oracle_best_te": post_refinement["oracle_best_te"],
+        "first_post_refinement_success_round": post_refinement["first_success_round"],
+        "selected_hypothesis_id": post_refinement["selected_hypothesis_id"],
+        "selected_re": post_refinement["selected_re"],
+        "selected_te": post_refinement["selected_te"],
+        "selected_success": post_refinement["selected_success"],
+    }
+
+
 def run_memory_graph_experiment(config, memory_config):
     loader = build_loader(config, memory_config)
     registrar = MemoryGuidedRegistration(memory_config)
     pair_limit = min(len(loader), int(getattr(config, "max_pairs", 0) or len(loader)))
-    output_dir = Path(getattr(config, "output_dir", "outputs/memory_graph"))
+    output_dir = Path(getattr(config, "memory_output_dir", "outputs/memory_graph"))
     output_dir.mkdir(parents=True, exist_ok=True)
     round_rows, candidate_rows, pair_rows = [], [], []
     logging.info("Historical correspondence memory configuration: %s", json.dumps(memory_config.report(), sort_keys=True))
@@ -289,26 +349,36 @@ def run_memory_graph_experiment(config, memory_config):
             load_started = time.perf_counter()
             pair = loader.get_pair(index)
             load_time = time.perf_counter() - load_started
+            r1_pose = load_required_r1_pose(pair, index, config)
             model_started = time.perf_counter()
-            result = registrar.run(pair.src_keypoints, pair.tgt_keypoints, pair.src_features, pair.tgt_features)
+            result = registrar.run(pair.src_keypoints, pair.tgt_keypoints, pair.src_features, pair.tgt_features, initial_pose=r1_pose)
             model_time = time.perf_counter() - model_started
-            audits = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.hypotheses]
-            audits_by_id = {item.hypothesis_id: audit for item, audit in zip(result.hypotheses, audits)}
+            if result.r1_hypothesis is None:
+                raise RuntimeError("memory_graph required R1 cache but no R1 archive parent was created.")
+            raw_audits = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.raw_hypotheses]
+            post_refinement_audits = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.post_refinement_hypotheses]
+            audits_by_id = {item.hypothesis_id: audit for item, audit in zip(result.post_refinement_hypotheses, post_refinement_audits)}
             for row in result.candidate_logs:
                 audit = audits_by_id.get(row["hypothesis_id"], {})
                 candidate_rows.append({"pair_id": pair.pair_id, **row, **audit})
-            repaired_before = False
+            r1_audit = audit_hypothesis(result.r1_hypothesis, pair.gt_transform, config.re_thre, config.te_thre) if result.r1_hypothesis else None
+            r1_failure = int(r1_audit is not None and not r1_audit["raw_success"])
+            raw_repaired_before, post_refinement_repaired_before = False, False
             for row in result.round_logs:
-                prefix = memory_prefix_audit(result.hypotheses, audits, row["round_id"], config.re_thre, config.te_thre)
-                if prefix is None:
-                    continue
-                repaired_now = bool(prefix["cumulative_oracle_success"] and not repaired_before)
-                repaired_before = repaired_before or bool(prefix["cumulative_oracle_success"])
+                audited_round = memory_round_audit(result, raw_audits, post_refinement_audits, row["round_id"], config.re_thre, config.te_thre)
+                raw_repaired_now = bool(r1_failure and audited_round["cumulative_raw_oracle_success"] and not raw_repaired_before)
+                post_refinement_repaired_now = bool(r1_failure and audited_round["cumulative_post_refinement_oracle_success"] and not post_refinement_repaired_before)
+                raw_repaired_before = raw_repaired_before or bool(r1_failure and audited_round["cumulative_raw_oracle_success"])
+                post_refinement_repaired_before = post_refinement_repaired_before or bool(r1_failure and audited_round["cumulative_post_refinement_oracle_success"])
                 round_rows.append({
                     "pair_id": pair.pair_id,
                     **row,
-                    **prefix,
-                    "newly_repaired": int(repaired_now),
+                    **audited_round,
+                    "r1_failure": r1_failure,
+                    "r1_failure_raw_oracle_success": int(r1_failure and audited_round["cumulative_raw_oracle_success"]),
+                    "r1_failure_post_refinement_oracle_success": int(r1_failure and audited_round["cumulative_post_refinement_oracle_success"]),
+                    "newly_raw_repaired_failure": int(raw_repaired_now),
+                    "newly_post_refinement_repaired_failure": int(post_refinement_repaired_now),
                 })
             if result.best is None:
                 selected_re, selected_te = pose_errors(result.pose, pair.gt_transform)
@@ -320,15 +390,21 @@ def run_memory_graph_experiment(config, memory_config):
             else:
                 selected = audit_hypothesis(result.best, pair.gt_transform, config.re_thre, config.te_thre)
             fmr_ratio, fmr, fmr_inlier_count = memory_candidate_fmr(pair, result, float(config.inlier_threshold))
-            first_success_round = next((item.round_id for item, audit in zip(result.hypotheses, audits) if audit["local_refined_success"]), -1)
+            first_raw_success_round = next((item.round_id for item, audit in zip(result.raw_hypotheses, raw_audits) if audit["raw_success"]), -1)
+            first_post_refinement_success_round = next((item.round_id for item, audit in zip(result.post_refinement_hypotheses, post_refinement_audits) if audit["local_refined_success"]), -1)
             pair_rows.append({
                 "pair_id": pair.pair_id,
-                "oracle_success": int(any(audit["local_refined_success"] for audit in audits)),
+                "r1_success": r1_audit["raw_success"] if r1_audit else 0,
+                "r1_failure": r1_failure,
+                "raw_oracle_success": int(any(audit["raw_success"] for audit in raw_audits)),
+                "post_refinement_oracle_success": int(any(audit["local_refined_success"] for audit in post_refinement_audits)),
                 "selected_success": selected["local_refined_success"],
                 "selected_re": selected["local_refined_re"],
                 "selected_te": selected["local_refined_te"],
-                "first_success_round": first_success_round,
-                "hypothesis_count": len(result.hypotheses),
+                "first_raw_success_round": first_raw_success_round,
+                "first_post_refinement_success_round": first_post_refinement_success_round,
+                "raw_hypothesis_count": len(result.raw_hypotheses),
+                "post_refinement_hypothesis_count": len(result.post_refinement_hypotheses),
                 "topk_candidate_fmr": fmr,
                 "topk_candidate_inlier_ratio": fmr_ratio,
                 "topk_candidate_inlier_count": fmr_inlier_count,
@@ -345,7 +421,8 @@ def run_memory_graph_experiment(config, memory_config):
     summary = {
         "method": "memory_graph",
         "pairs": len(pair_rows),
-        "oracle_rr": float(np.mean([row["oracle_success"] for row in pair_rows])) if pair_rows else 0.0,
+        "raw_oracle_rr": float(np.mean([row["raw_oracle_success"] for row in pair_rows])) if pair_rows else 0.0,
+        "post_refinement_oracle_rr": float(np.mean([row["post_refinement_oracle_success"] for row in pair_rows])) if pair_rows else 0.0,
         "selected_rr": float(np.mean([row["selected_success"] for row in pair_rows])) if pair_rows else 0.0,
         "mean_re": float(np.mean([row["selected_re"] for row in pair_rows])) if pair_rows else 0.0,
         "mean_te": float(np.mean([row["selected_te"] for row in pair_rows])) if pair_rows else 0.0,
@@ -353,18 +430,28 @@ def run_memory_graph_experiment(config, memory_config):
         "topk_candidate_inlier_ratio": float(np.mean([row["topk_candidate_inlier_ratio"] for row in pair_rows])) if pair_rows else 0.0,
         "mean_topk_candidate_inlier_count": float(np.mean([row["topk_candidate_inlier_count"] for row in pair_rows])) if pair_rows else 0.0,
         "mean_model_time": float(np.mean([row["model_time"] for row in pair_rows])) if pair_rows else 0.0,
-        "mean_hypothesis_count": float(np.mean([row["hypothesis_count"] for row in pair_rows])) if pair_rows else 0.0,
-        "mean_duplicate_basin_rate": float(np.mean([row["duplicate_basin_rate"] for row in round_rows])) if round_rows else 0.0,
-        "mean_first_success_round": float(np.mean([row["first_success_round"] for row in pair_rows if row["first_success_round"] >= 0])) if any(row["first_success_round"] >= 0 for row in pair_rows) else -1.0,
+        "mean_raw_hypothesis_count": float(np.mean([row["raw_hypothesis_count"] for row in pair_rows])) if pair_rows else 0.0,
+        "mean_post_refinement_hypothesis_count": float(np.mean([row["post_refinement_hypothesis_count"] for row in pair_rows])) if pair_rows else 0.0,
+        "mean_duplicate_basin_rate": float(np.mean([row["duplicate_basin_rate"] for row in round_rows if row["duplicate_basin_rate"] is not None])) if any(row["duplicate_basin_rate"] is not None for row in round_rows) else None,
+        "r1_failure_count": int(sum(row["r1_failure"] for row in pair_rows)),
+        "r1_failure_raw_oracle_rr": float(np.mean([row["raw_oracle_success"] for row in pair_rows if row["r1_failure"]])) if any(row["r1_failure"] for row in pair_rows) else 0.0,
+        "r1_failure_post_refinement_oracle_rr": float(np.mean([row["post_refinement_oracle_success"] for row in pair_rows if row["r1_failure"]])) if any(row["r1_failure"] for row in pair_rows) else 0.0,
+        "selected_rr_on_post_refinement_repairable": float(np.mean([row["selected_success"] for row in pair_rows if row["r1_failure"] and row["post_refinement_oracle_success"]])) if any(row["r1_failure"] and row["post_refinement_oracle_success"] for row in pair_rows) else 0.0,
         "round_metrics": {
             str(round_id): {
                 "pairs": len(rows),
-                "oracle_rr": float(np.mean([row["cumulative_oracle_success"] for row in rows])),
+                "raw_oracle_rr": float(np.mean([row["cumulative_raw_oracle_success"] for row in rows])),
+                "post_refinement_oracle_rr": float(np.mean([row["cumulative_post_refinement_oracle_success"] for row in rows])),
                 "selected_rr": float(np.mean([row["selected_success"] for row in rows])),
-                "newly_repaired": int(sum(row["newly_repaired"] for row in rows)),
-                "oracle_best_re": float(np.mean([row["oracle_best_re"] for row in rows])),
-                "oracle_best_te": float(np.mean([row["oracle_best_te"] for row in rows])),
-                "duplicate_basin_rate": float(np.mean([row["duplicate_basin_rate"] for row in rows])),
+                "r1_failure_raw_oracle_rr": float(np.mean([row["r1_failure_raw_oracle_success"] for row in rows if row["r1_failure"]])) if any(row["r1_failure"] for row in rows) else 0.0,
+                "r1_failure_post_refinement_oracle_rr": float(np.mean([row["r1_failure_post_refinement_oracle_success"] for row in rows if row["r1_failure"]])) if any(row["r1_failure"] for row in rows) else 0.0,
+                "newly_raw_repaired_failures": int(sum(row["newly_raw_repaired_failure"] for row in rows)),
+                "newly_post_refinement_repaired_failures": int(sum(row["newly_post_refinement_repaired_failure"] for row in rows)),
+                "raw_oracle_best_re": float(np.mean([row["raw_oracle_best_re"] for row in rows])),
+                "raw_oracle_best_te": float(np.mean([row["raw_oracle_best_te"] for row in rows])),
+                "post_refinement_oracle_best_re": float(np.mean([row["post_refinement_oracle_best_re"] for row in rows])),
+                "post_refinement_oracle_best_te": float(np.mean([row["post_refinement_oracle_best_te"] for row in rows])),
+                "duplicate_basin_rate": float(np.mean([row["duplicate_basin_rate"] for row in rows if row["duplicate_basin_rate"] is not None])) if any(row["duplicate_basin_rate"] is not None for row in rows) else None,
             }
             for round_id in sorted({row["round_id"] for row in round_rows})
             for rows in [[row for row in round_rows if row["round_id"] == round_id]]

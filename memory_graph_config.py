@@ -29,17 +29,25 @@ class MemoryGraphConfig:
     memory_lambda_coverage: float = 1.0
     memory_lambda_basin_negative: float = 1.0
     memory_lambda_basin_positive: float = 1.0
+    memory_basin_presearch_penalty: float = 1.0
     memory_support_min: int = 3
     memory_support_max: int = 32
     memory_support_trial_count: int = 8
-    memory_min_eigen_entropy: float = 0.20
-    memory_min_coverage: float = 0.20
+    memory_signature_entropy_temperature: float = 0.10
+    memory_min_lambda12_ratio: float = 0.10
+    memory_min_lambda13_ratio: float = 0.05
+    memory_min_coverage: float = 0.002
     memory_coverage_voxel_size: float = 0.10
+    memory_cross_group_voxel_size: float = 0.30
+    memory_min_cross_group_agreement: float = 0.50
     memory_hypotheses_per_round: int = 24
     memory_max_rounds: int = 8
     memory_inlier_threshold: float = 0.10
     memory_tls_threshold: float = 0.10
     memory_tls_iters: int = 3
+    memory_refine_trust_rotation_deg: float = 15.0
+    memory_refine_trust_translation: float = 0.30
+    memory_refine_min_score_improvement: float = 0.01
     memory_prosac_initial_fraction: float = 0.20
     memory_prosac_growth: float = 0.15
     memory_basin_rotation_deg: float = 5.0
@@ -61,6 +69,7 @@ class MemoryGraphConfig:
     memory_use_reliability: bool = True
     memory_use_relation_history: bool = True
     memory_use_basin: bool = True
+    memory_require_r1_cache: bool = True
 
     @classmethod
     def from_mapping(cls, values):
@@ -100,12 +109,15 @@ class MemoryGraphConfig:
             self.memory_lambda_coverage,
             self.memory_lambda_basin_negative,
             self.memory_lambda_basin_positive,
+            self.memory_basin_presearch_penalty,
         ) < 0:
             raise ValueError("memory score weights must be non-negative.")
-        if not 0 <= self.memory_min_eigen_entropy <= 1 or not 0 <= self.memory_min_coverage <= 1 or self.memory_coverage_voxel_size <= 0:
+        if self.memory_signature_entropy_temperature <= 0 or not 0 <= self.memory_min_lambda12_ratio <= 1 or not 0 <= self.memory_min_lambda13_ratio <= 1 or not 0 <= self.memory_min_coverage <= 1 or self.memory_coverage_voxel_size <= 0 or self.memory_cross_group_voxel_size <= 0 or not 0 <= self.memory_min_cross_group_agreement <= 1:
             raise ValueError("memory structural constraints are invalid.")
         if self.memory_hypotheses_per_round < 1 or self.memory_max_rounds < 1 or self.memory_inlier_threshold <= 0 or self.memory_tls_threshold <= 0 or self.memory_tls_iters < 0:
             raise ValueError("memory search budget is invalid.")
+        if self.memory_refine_trust_rotation_deg <= 0 or self.memory_refine_trust_translation <= 0 or self.memory_refine_min_score_improvement < 0:
+            raise ValueError("memory refinement settings are invalid.")
         if not 0 < self.memory_prosac_initial_fraction <= 1 or self.memory_prosac_growth < 0:
             raise ValueError("memory PROSAC schedule is invalid.")
         if self.memory_basin_rotation_deg <= 0 or self.memory_basin_translation <= 0 or self.memory_basin_max < 1 or not 0 <= self.memory_basin_signature_momentum < 1 or not 0 <= self.memory_basin_signature_similarity <= 1:
@@ -114,6 +126,8 @@ class MemoryGraphConfig:
             raise ValueError("memory stopping configuration is invalid.")
         if self.memory_strong_stop_min_inliers < 3 or not 0 < self.memory_strong_stop_inlier_fraction <= 1 or self.memory_strong_stop_error_ratio <= 0 or not 0 <= self.memory_strong_stop_coverage <= 1:
             raise ValueError("memory strong-stop configuration is invalid.")
+        if not self.memory_require_r1_cache:
+            raise ValueError("memory_graph requires fixed R1 cache for fair repair evaluation.")
         return self
 
     def report(self):

@@ -78,7 +78,7 @@ IRIS-Reg 3DLoMatch + Predator：
 python test_3DLoMatch.py --config_path config_json/config_3DLoMatch_Predator.json
 ```
 
-Historical correspondence-memory search (pure point cloud; does not read the RGB-D ray manifest):
+Historical correspondence-memory search (does not read RGB-D rays; requires the fixed `r1_cache_dir` entries for fair R1-failure evaluation):
 
 ```bash
 python test_3DLoMatch.py --config_path config_json/config_3DLoMatch_FPFH_redkitchen_modified.json --method memory_graph

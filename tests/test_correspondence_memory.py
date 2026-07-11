@@ -1,12 +1,14 @@
 import json
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from correspondence_memory import CorrespondenceMemory
 from iterative_ray_config import IterativeRayConfig
 from memory_graph_config import MemoryGraphConfig
-from memory_guided_registration import MemoryGuidedRegistration
+from memory_guided_registration import MemoryGuidedRegistration, MemoryHypothesis
+from test_3DLoMatch import audit_hypothesis, memory_round_audit
 
 
 def config(**overrides):
@@ -18,9 +20,12 @@ def config(**overrides):
         "memory_tau_g": 0.5,
         "memory_support_min": 3,
         "memory_support_max": 6,
-        "memory_min_eigen_entropy": 0.05,
-        "memory_min_coverage": 0.2,
+        "memory_min_lambda12_ratio": 0.01,
+        "memory_min_lambda13_ratio": 0.01,
+        "memory_min_coverage": 0.001,
         "memory_coverage_voxel_size": 0.05,
+        "memory_cross_group_voxel_size": 0.10,
+        "memory_min_cross_group_agreement": 0.1,
         "memory_hypotheses_per_round": 6,
         "memory_max_rounds": 3,
         "memory_inlier_threshold": 0.01,
@@ -52,6 +57,24 @@ def synthetic_pair():
 
 
 class CorrespondenceMemoryTests(unittest.TestCase):
+    @staticmethod
+    def hypothesis(hypothesis_id, round_id, pose, stage="raw", parent_id=-1, score=0.0):
+        return MemoryHypothesis(
+            hypothesis_id,
+            parent_id,
+            round_id,
+            stage,
+            pose,
+            pose,
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0),
+            score,
+            score,
+            torch.zeros(5),
+            None,
+        )
+
     def test_memory_graph_does_not_require_ray_manifest(self):
         self.assertEqual(config().method, "memory_graph")
         self.assertNotIn("ray_manifest", config().report())
@@ -69,6 +92,8 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         del invalid["memory_topk"]
         with self.assertRaises(KeyError):
             MemoryGraphConfig.from_mapping(invalid)
+        with self.assertRaises(ValueError):
+            config(memory_require_r1_cache=False)
 
     def test_posterior_and_relation_updates_use_current_best_support(self):
         source, target, source_features, target_features, _, _ = synthetic_pair()
@@ -87,25 +112,108 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         memory.update_relation_graph(correct[:6], inliers, residuals)
         self.assertGreater(float(memory.edge_success.sum()), 0.0)
 
+    def test_disabled_memory_layers_do_not_update_or_affect_estimation_weights(self):
+        source, target, source_features, target_features, _, _ = synthetic_pair()
+        memory = CorrespondenceMemory(
+            source,
+            target,
+            source_features,
+            target_features,
+            config(memory_use_reliability=False, memory_use_relation_history=False, memory_use_basin=False),
+        )
+        support = torch.arange(4)
+        inliers = torch.zeros(memory.count, dtype=torch.bool)
+        alpha_before, beta_before = memory.alpha.clone(), memory.beta.clone()
+        self.assertEqual(memory.update_pair_posterior(support, inliers), 0.0)
+        self.assertTrue(torch.equal(memory.alpha, alpha_before))
+        self.assertTrue(torch.equal(memory.beta, beta_before))
+        self.assertTrue(torch.equal(memory.estimation_weights(support), torch.ones_like(support, dtype=memory.dtype)))
+        signature = memory.support_signature(support)
+        self.assertEqual(memory.update_basin(torch.eye(4)[None], signature, 0.0, improved=False), (None, None))
+        self.assertEqual(len(memory.basins), 0)
+        self.assertEqual(float(memory.presearch_basin_penalty(signature)), 0.0)
+
     def test_basin_penalty_requires_matching_support_signature(self):
         source, target, source_features, target_features, _, _ = synthetic_pair()
         memory = CorrespondenceMemory(source, target, source_features, target_features, config())
         support = torch.where(memory.src_indices == memory.tgt_indices)[0][:6]
         signature = memory.support_signature(support)
+        objective_before = float(memory.support_objective(support))
         pose = torch.eye(4)[None]
         memory.update_basin(pose, signature, 1.0, improved=False)
         self.assertLess(memory.basin_bonus(pose, signature), 0.0)
+        self.assertGreater(float(memory.presearch_basin_penalty(signature)), 0.0)
+        self.assertLess(float(memory.support_objective(support)), objective_before)
         self.assertEqual(memory.basin_bonus(pose, torch.zeros_like(signature)), 0.0)
+
+    def test_signature_reports_global_coverage_and_planar_degeneracy(self):
+        grid_x, grid_y = torch.meshgrid(torch.arange(4), torch.arange(4), indexing="ij")
+        source = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1), torch.zeros(16)], dim=1).float() * 0.1
+        target = source + torch.tensor([0.1, 0.0, 0.0])
+        features = torch.eye(16)
+        memory = CorrespondenceMemory(source[None], target[None], features[None], features[None], config())
+        support = torch.where(memory.src_indices == memory.tgt_indices)[0][:6]
+        signature = memory.support_signature(support)
+        self.assertEqual(signature.numel(), 5)
+        self.assertLess(float(signature[2]), 0.01)
+        self.assertLess(float(signature[3]), 1.0)
+        self.assertTrue(memory.is_degenerate(support))
 
     def test_memory_search_estimates_full_rigid_pose_and_preserves_raw_seed_pose(self):
         source, target, source_features, target_features, rotation, translation = synthetic_pair()
-        result = MemoryGuidedRegistration(config()).run(source, target, source_features, target_features)
+        r1_pose = torch.eye(4)[None]
+        r1_pose[0, :3, :3], r1_pose[0, :3, 3] = rotation, translation
+        result = MemoryGuidedRegistration(config()).run(source, target, source_features, target_features, initial_pose=r1_pose)
         self.assertIsNotNone(result.best)
         self.assertTrue(result.round_logs)
         self.assertGreaterEqual(result.best.inlier_ids.numel(), 4)
         self.assertTrue(torch.allclose(result.pose[0, :3, :3], rotation, atol=1e-4))
         self.assertTrue(torch.allclose(result.pose[0, :3, 3], translation, atol=1e-4))
         self.assertEqual(result.best.pose_raw.shape, result.best.pose_local_refined.shape)
+        with self.assertRaises(ValueError):
+            MemoryGuidedRegistration(config()).run(source, target, source_features, target_features)
+
+    def test_raw_parent_survives_rejected_refinement_child(self):
+        class RejectingRefiner(MemoryGuidedRegistration):
+            def _robust_refine(self, memory, pose):
+                rejected = pose.clone()
+                rejected[0, 0, 3] += 1.0
+                return rejected
+
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        r1_pose = torch.eye(4)[None]
+        r1_pose[0, :3, :3], r1_pose[0, :3, 3] = rotation, translation
+        result = RejectingRefiner(config(
+            memory_max_rounds=1,
+            memory_min_lambda12_ratio=0.0,
+            memory_min_lambda13_ratio=0.0,
+            memory_min_coverage=0.0,
+            memory_min_cross_group_agreement=0.0,
+        )).run(source, target, source_features, target_features, initial_pose=r1_pose)
+        raw_ids = {item.hypothesis_id for item in result.raw_hypotheses}
+        post_ids = {item.hypothesis_id for item in result.post_refinement_hypotheses}
+        self.assertTrue(raw_ids.issubset(post_ids))
+        self.assertTrue(any(item.stage == "raw" and item.inlier_ids.numel() >= 4 for item in result.raw_hypotheses))
+        self.assertFalse(any(item.stage == "refinement_child" for item in result.post_refinement_hypotheses))
+        self.assertTrue(any(row["stage"] == "refinement_child" and not row["accepted"] for row in result.candidate_logs))
+        self.assertEqual(result.best.hypothesis_id, result.r1_hypothesis.hypothesis_id)
+
+    def test_memory_oracle_prefix_keeps_raw_parent_and_hides_future_success(self):
+        identity = torch.eye(4)[None]
+        failed_r1_pose = identity.clone()
+        failed_r1_pose[0, 0, 3] = 1.0
+        r1 = self.hypothesis(0, 0, failed_r1_pose, stage="r1", score=2.0)
+        raw = self.hypothesis(1, 1, identity, score=1.0)
+        rejected_child = self.hypothesis(2, 1, failed_r1_pose, stage="refinement_child", parent_id=1, score=0.0)
+        result = SimpleNamespace(raw_hypotheses=[r1, raw], post_refinement_hypotheses=[r1, raw])
+        raw_audits = [audit_hypothesis(item, identity, 15.0, 30.0) for item in result.raw_hypotheses]
+        post_audits = [audit_hypothesis(item, identity, 15.0, 30.0) for item in result.post_refinement_hypotheses]
+        before = memory_round_audit(result, raw_audits, post_audits, 0, 15.0, 30.0)
+        after = memory_round_audit(result, raw_audits, post_audits, 1, 15.0, 30.0)
+        self.assertEqual(before["cumulative_raw_oracle_success"], 0)
+        self.assertEqual(after["cumulative_raw_oracle_success"], 1)
+        self.assertEqual(after["cumulative_post_refinement_oracle_success"], 1)
+        self.assertNotIn(rejected_child.hypothesis_id, {item.hypothesis_id for item in result.post_refinement_hypotheses})
 
 
 if __name__ == "__main__":

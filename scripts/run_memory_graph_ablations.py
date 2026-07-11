@@ -33,7 +33,7 @@ def main():
         config = edict(copy.deepcopy(base))
         config._selected_method = "memory_graph"
         config.memory_graph.update(VARIANTS[name])
-        config.output_dir = str(Path(args.output_root) / name)
+        config.memory_output_dir = str(Path(args.output_root) / name)
         run_experiment(config)
 
 
