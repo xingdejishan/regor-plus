@@ -416,6 +416,7 @@ class IterativeRaySearch:
         candidate_logs = [{**self._candidate_log(pair_inputs.get("pair_id", ""), post_r1), "archive_stage": "post_refine"}]
         raw_candidate_logs = [{**self._candidate_log(pair_inputs.get("pair_id", ""), raw_r1), "archive_stage": "raw"}]
         refinement_logs, refinement_candidates = [], []
+        next_child_id = 1_000_000
         stagnation = 0
         timings = {"constraint_time": 0.0, "candidate_generation_time": 0.0, "candidate_validation_time": 0.0, "total_time": 0.0}
         if self.config.method == "r1_only":
@@ -505,7 +506,8 @@ class IterativeRaySearch:
                     parent.refinement_accepted = False
                     parent.refinement_reject_reason = "insufficient_correspondences"
                     continue
-                raw_archive.assign_ids([child])
+                child.hypothesis_id = next_child_id
+                next_child_id += 1
                 parent.refinement_child_id = child.hypothesis_id
                 self._score(child, scoring_inputs)
                 repeated, distance, similarity = (False, float("inf"), 0.0) if self.config.method == "repeated_regor" else memory.repeated_basin(

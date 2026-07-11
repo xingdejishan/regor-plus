@@ -13,8 +13,8 @@ class RegistrationPair:
     tgt_features: torch.Tensor
     src_overlap: torch.Tensor
     tgt_overlap: torch.Tensor
-    src_ray_bundle: RayBundle
-    tgt_ray_bundle: RayBundle
+    src_ray_bundle: RayBundle | None
+    tgt_ray_bundle: RayBundle | None
     gt_transform: torch.Tensor | None
     pair_id: str
 

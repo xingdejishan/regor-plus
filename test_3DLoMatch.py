@@ -19,6 +19,8 @@ from hypothesis_generation import sample_correspondences
 from initial_matching_plus import Matcher_plus
 from iterative_ray_config import IterativeRayConfig
 from iterative_ray_search import IterativeRaySearch, RaySelector
+from memory_graph_config import MemoryGraphConfig
+from memory_guided_registration import MemoryGuidedRegistration
 from ray_constraint_builder import RayConstraintBuilder
 from ray_guided_regenerator import PoseHypothesis, RayGuidedRegenerator
 from ray_pose_validator import RayPoseValidator
@@ -64,6 +66,8 @@ def load_or_run_r1(pair, pair_index, matcher, regenerator, config):
     if cache_dir:
         path = r1_cache_path(cache_dir, pair_index)
         if path.exists():
+            if getattr(config, "r1_cache_rng_warmup", False) and pair_index >= int(getattr(config, "r1_cache_rng_warmup_start_index", 1)):
+                run_r1(pair, matcher, regenerator, config)
             payload = torch.load(path, map_location=pair.src_keypoints.device, weights_only=True)
             return PoseHypothesis(
                 hypothesis_id=-1,
@@ -175,7 +179,19 @@ def build_search(config, local_regenerator):
     )
 
 
-def build_loader(config, ray_config):
+def build_loader(config, search_config):
+    if isinstance(search_config, MemoryGraphConfig):
+        return ThreeDLoMatchLoader(
+            root=config.data_path,
+            descriptor=config.descriptor,
+            inlier_threshold=config.inlier_threshold,
+            num_node=config.num_node,
+            use_mutual=config.use_mutual,
+            overlap_pred_root=getattr(config, "overlap_pred_root", ""),
+            use_overlap_proxy=getattr(config, "use_overlap_proxy", False),
+            ray_manifest="",
+        )
+    ray_config = search_config
     return ThreeDLoMatchLoader(
         root=config.data_path,
         descriptor=config.descriptor,
@@ -221,8 +237,151 @@ def run_r1(pair, matcher, regenerator, config):
     )
 
 
+def memory_candidate_fmr(pair, result, threshold):
+    if result.candidate_src_indices.numel() == 0:
+        return 0.0, 0, 0
+    source = pair.src_keypoints[0, result.candidate_src_indices]
+    target = pair.tgt_keypoints[0, result.candidate_tgt_indices]
+    matrix = pair.gt_transform[0]
+    source = source @ matrix[:3, :3].transpose(0, 1) + matrix[:3, 3]
+    inlier_count = int((torch.linalg.norm(source - target, dim=1) < threshold).sum().item())
+    ratio = inlier_count / result.candidate_src_indices.numel()
+    return ratio, int(ratio >= 0.05), inlier_count
+
+
+def memory_prefix_audit(hypotheses, audits, round_id, rotation_threshold, translation_threshold):
+    eligible = [(hypothesis, audit) for hypothesis, audit in zip(hypotheses, audits) if hypothesis.round_id <= round_id]
+    if not eligible:
+        return None
+    oracle_hypothesis, oracle = min(
+        eligible,
+        key=lambda item: (
+            max(item[1]["local_refined_re"] / rotation_threshold, item[1]["local_refined_te"] / translation_threshold),
+            item[1]["local_refined_re"],
+            item[1]["local_refined_te"],
+        ),
+    )
+    selected_hypothesis, selected = max(eligible, key=lambda item: item[0].score)
+    success_rounds = [hypothesis.round_id for hypothesis, audit in eligible if audit["local_refined_success"]]
+    return {
+        "oracle_hypothesis_id": oracle_hypothesis.hypothesis_id,
+        "cumulative_oracle_success": int(any(audit["local_refined_success"] for _, audit in eligible)),
+        "oracle_best_re": oracle["local_refined_re"],
+        "oracle_best_te": oracle["local_refined_te"],
+        "first_success_round": min(success_rounds) if success_rounds else -1,
+        "selected_hypothesis_id": selected_hypothesis.hypothesis_id,
+        "selected_re": selected["local_refined_re"],
+        "selected_te": selected["local_refined_te"],
+        "selected_success": selected["local_refined_success"],
+    }
+
+
+def run_memory_graph_experiment(config, memory_config):
+    loader = build_loader(config, memory_config)
+    registrar = MemoryGuidedRegistration(memory_config)
+    pair_limit = min(len(loader), int(getattr(config, "max_pairs", 0) or len(loader)))
+    output_dir = Path(getattr(config, "output_dir", "outputs/memory_graph"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    round_rows, candidate_rows, pair_rows = [], [], []
+    logging.info("Historical correspondence memory configuration: %s", json.dumps(memory_config.report(), sort_keys=True))
+    with torch.no_grad():
+        for index in tqdm(range(pair_limit)):
+            load_started = time.perf_counter()
+            pair = loader.get_pair(index)
+            load_time = time.perf_counter() - load_started
+            model_started = time.perf_counter()
+            result = registrar.run(pair.src_keypoints, pair.tgt_keypoints, pair.src_features, pair.tgt_features)
+            model_time = time.perf_counter() - model_started
+            audits = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.hypotheses]
+            audits_by_id = {item.hypothesis_id: audit for item, audit in zip(result.hypotheses, audits)}
+            for row in result.candidate_logs:
+                audit = audits_by_id.get(row["hypothesis_id"], {})
+                candidate_rows.append({"pair_id": pair.pair_id, **row, **audit})
+            repaired_before = False
+            for row in result.round_logs:
+                prefix = memory_prefix_audit(result.hypotheses, audits, row["round_id"], config.re_thre, config.te_thre)
+                if prefix is None:
+                    continue
+                repaired_now = bool(prefix["cumulative_oracle_success"] and not repaired_before)
+                repaired_before = repaired_before or bool(prefix["cumulative_oracle_success"])
+                round_rows.append({
+                    "pair_id": pair.pair_id,
+                    **row,
+                    **prefix,
+                    "newly_repaired": int(repaired_now),
+                })
+            if result.best is None:
+                selected_re, selected_te = pose_errors(result.pose, pair.gt_transform)
+                selected = {
+                    "local_refined_re": selected_re,
+                    "local_refined_te": selected_te,
+                    "local_refined_success": int(selected_re < config.re_thre and selected_te < config.te_thre),
+                }
+            else:
+                selected = audit_hypothesis(result.best, pair.gt_transform, config.re_thre, config.te_thre)
+            fmr_ratio, fmr, fmr_inlier_count = memory_candidate_fmr(pair, result, float(config.inlier_threshold))
+            first_success_round = next((item.round_id for item, audit in zip(result.hypotheses, audits) if audit["local_refined_success"]), -1)
+            pair_rows.append({
+                "pair_id": pair.pair_id,
+                "oracle_success": int(any(audit["local_refined_success"] for audit in audits)),
+                "selected_success": selected["local_refined_success"],
+                "selected_re": selected["local_refined_re"],
+                "selected_te": selected["local_refined_te"],
+                "first_success_round": first_success_round,
+                "hypothesis_count": len(result.hypotheses),
+                "topk_candidate_fmr": fmr,
+                "topk_candidate_inlier_ratio": fmr_ratio,
+                "topk_candidate_inlier_count": fmr_inlier_count,
+                "load_time": load_time,
+                "model_time": model_time,
+                **result.memory_summary,
+            })
+    for filename, rows in (("pair_results.csv", pair_rows), ("round_logs.csv", round_rows), ("candidate_logs.csv", candidate_rows)):
+        if rows:
+            with open(output_dir / filename, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=sorted({key for row in rows for key in row}))
+                writer.writeheader()
+                writer.writerows(rows)
+    summary = {
+        "method": "memory_graph",
+        "pairs": len(pair_rows),
+        "oracle_rr": float(np.mean([row["oracle_success"] for row in pair_rows])) if pair_rows else 0.0,
+        "selected_rr": float(np.mean([row["selected_success"] for row in pair_rows])) if pair_rows else 0.0,
+        "mean_re": float(np.mean([row["selected_re"] for row in pair_rows])) if pair_rows else 0.0,
+        "mean_te": float(np.mean([row["selected_te"] for row in pair_rows])) if pair_rows else 0.0,
+        "topk_candidate_fmr": float(np.mean([row["topk_candidate_fmr"] for row in pair_rows])) if pair_rows else 0.0,
+        "topk_candidate_inlier_ratio": float(np.mean([row["topk_candidate_inlier_ratio"] for row in pair_rows])) if pair_rows else 0.0,
+        "mean_topk_candidate_inlier_count": float(np.mean([row["topk_candidate_inlier_count"] for row in pair_rows])) if pair_rows else 0.0,
+        "mean_model_time": float(np.mean([row["model_time"] for row in pair_rows])) if pair_rows else 0.0,
+        "mean_hypothesis_count": float(np.mean([row["hypothesis_count"] for row in pair_rows])) if pair_rows else 0.0,
+        "mean_duplicate_basin_rate": float(np.mean([row["duplicate_basin_rate"] for row in round_rows])) if round_rows else 0.0,
+        "mean_first_success_round": float(np.mean([row["first_success_round"] for row in pair_rows if row["first_success_round"] >= 0])) if any(row["first_success_round"] >= 0 for row in pair_rows) else -1.0,
+        "round_metrics": {
+            str(round_id): {
+                "pairs": len(rows),
+                "oracle_rr": float(np.mean([row["cumulative_oracle_success"] for row in rows])),
+                "selected_rr": float(np.mean([row["selected_success"] for row in rows])),
+                "newly_repaired": int(sum(row["newly_repaired"] for row in rows)),
+                "oracle_best_re": float(np.mean([row["oracle_best_re"] for row in rows])),
+                "oracle_best_te": float(np.mean([row["oracle_best_te"] for row in rows])),
+                "duplicate_basin_rate": float(np.mean([row["duplicate_basin_rate"] for row in rows])),
+            }
+            for round_id in sorted({row["round_id"] for row in round_rows})
+            for rows in [[row for row in round_rows if row["round_id"] == round_id]]
+        },
+        "config": memory_config.report(),
+    }
+    with open(output_dir / "metrics.json", "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    logging.info("%s", json.dumps(summary, ensure_ascii=False))
+    return summary
+
+
 def run_experiment(config):
     set_experiment_seed(int(getattr(config, "seed", 51)))
+    if getattr(config, "_selected_method", "") == "memory_graph":
+        memory_config = MemoryGraphConfig.from_mapping(config.memory_graph).validate()
+        return run_memory_graph_experiment(config, memory_config)
     local_regenerator = Regenerator(
         inlier_threshold=config.inlier_threshold,
         num_node="all",
@@ -409,9 +568,15 @@ def run_experiment(config):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", required=True)
+    parser.add_argument("--method", choices=["iterative_ray", "r1_only", "repeated_regor", "shuffled_ray", "memory_graph"])
     args = parser.parse_args()
     with open(args.config_path, "r", encoding="utf-8") as handle:
         config = edict(json.load(handle))
+    if args.method:
+        if args.method == "memory_graph":
+            config._selected_method = args.method
+        else:
+            config.iterative_ray["method"] = args.method
     os.environ["CUDA_VISIBLE_DEVICES"] = config.CUDA_Devices
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
     run_experiment(config)

@@ -78,6 +78,19 @@ IRIS-Reg 3DLoMatch + Predator：
 python test_3DLoMatch.py --config_path config_json/config_3DLoMatch_Predator.json
 ```
 
+Historical correspondence-memory search (pure point cloud; does not read the RGB-D ray manifest):
+
+```bash
+python test_3DLoMatch.py --config_path config_json/config_3DLoMatch_FPFH_redkitchen_modified.json --method memory_graph
+python test_3DLoMatch.py --config_path config_json/config_3DLoMatch_Predator.json --method memory_graph
+```
+
+The memory-graph ablation runs the fixed top-K correspondence table with no memory, posterior-only, posterior+graph, posterior+basin, and the full three-layer memory:
+
+```bash
+python scripts/run_memory_graph_ablations.py --config-path config_json/config_3DLoMatch_FPFH_redkitchen_modified.json
+```
+
 两个 IRIS-Reg 配置都使用 `./3dmatch_raw/test` 和 `data/3DMatch/free_space/redkitchen_manifest.json`。当前仓库仅包含 redkitchen 的原始 RGB-D 与 manifest，因此两者的 `max_pairs=525` 只覆盖该子集；缺少其他场景 manifest 时程序会直接报错，不会退化为几何 proxy。
 
 旧的 `config_3DLoMatch_FCGF.json`、`config_3DLoMatch_FPFH.json` 仍是传统 REGOR 配置，不能传给新的迭代射线入口。`IterativeRayConfig` 会拒绝未知字段和缺失字段，避免把旧 `active_round2_*` 参数静默忽略。

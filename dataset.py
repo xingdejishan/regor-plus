@@ -212,7 +212,7 @@ class ThreeDLoMatchLoader(data.Dataset):
 
     def _ray_bundle(self, scene, fragment_id, device):
         if not self.ray_manifest:
-            raise ValueError("ThreeDLoMatchLoader.get_pair requires ray_manifest.")
+            return None
         key = (scene, str(fragment_id))
         if key not in self._ray_cache:
             self._ray_cache[key] = build_ray_bundle(
