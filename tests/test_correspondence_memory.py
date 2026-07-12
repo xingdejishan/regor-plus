@@ -59,21 +59,36 @@ def synthetic_pair():
 
 class CorrespondenceMemoryTests(unittest.TestCase):
     @staticmethod
-    def hypothesis(hypothesis_id, round_id, pose, stage="raw", parent_id=-1, score=0.0):
+    def hypothesis(
+        hypothesis_id,
+        round_id,
+        pose,
+        stage="raw",
+        parent_id=-1,
+        score=0.0,
+        search_score=0.0,
+        structure_penalty=0.0,
+        basin_adjustment=0.0,
+    ):
         return MemoryHypothesis(
-            hypothesis_id,
-            parent_id,
-            round_id,
-            stage,
-            pose,
-            pose,
-            torch.empty(0, dtype=torch.long),
-            torch.empty(0, dtype=torch.long),
-            torch.empty(0),
-            score,
-            score,
-            torch.zeros(5),
-            None,
+            hypothesis_id=hypothesis_id,
+            parent_id=parent_id,
+            round_id=round_id,
+            stage=stage,
+            pose_raw=pose,
+            pose_local_refined=pose,
+            support_ids=torch.empty(0, dtype=torch.long),
+            inlier_ids=torch.empty(0, dtype=torch.long),
+            residuals=torch.empty(0),
+            validation_score=score,
+            search_score=search_score,
+            inlier_count=0,
+            mean_inlier_error=float("inf"),
+            coverage=0.0,
+            support_signature=torch.zeros(5),
+            basin_key=None,
+            structure_penalty=structure_penalty,
+            basin_adjustment=basin_adjustment,
         )
 
     def test_memory_graph_does_not_require_ray_manifest(self):
@@ -170,7 +185,7 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         self.assertEqual(result.r1_initialization["r1_posterior_delta"], 0.0)
         self.assertEqual(result.r1_initialization["r1_graph_delta"], 0.0)
 
-    def test_disabled_memory_layers_do_not_update_or_affect_estimation_weights(self):
+    def test_disabled_memory_layers_do_not_update_and_fixed_estimation_is_unity(self):
         source, target, source_features, target_features, _, _ = synthetic_pair()
         memory = CorrespondenceMemory(
             source,
@@ -185,11 +200,151 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         self.assertEqual(memory.update_pair_posterior(support, inliers), 0.0)
         self.assertTrue(torch.equal(memory.alpha, alpha_before))
         self.assertTrue(torch.equal(memory.beta, beta_before))
-        self.assertTrue(torch.equal(memory.estimation_weights(support), torch.ones_like(support, dtype=memory.dtype)))
+        fixed = memory.fixed_estimation_weights(support)
+        self.assertTrue(torch.equal(fixed, torch.ones(support.numel(), dtype=memory.dtype)))
+        self.assertTrue(torch.equal(memory.estimation_weights(support), fixed))
         signature = memory.support_signature(support)
         self.assertEqual(memory.update_basin(torch.eye(4)[None], signature, 0.0, improved=False, support_ids=support), (None, None))
         self.assertEqual(len(memory.basins), 0)
         self.assertEqual(float(memory.presearch_basin_penalty(signature, support)), 0.0)
+
+    def test_search_reliability_changes_but_fixed_estimation_weights_do_not(self):
+        source, target, source_features, target_features, _, _ = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        support = torch.arange(4)
+        search_before = memory.search_reliability(support).clone()
+        fixed_before = memory.fixed_estimation_weights(support)
+        memory.alpha[support] = 100.0
+        memory.beta[support] = 0.1
+        search_after = memory.search_reliability(support)
+        fixed_after = memory.fixed_estimation_weights(support)
+        self.assertFalse(torch.allclose(search_before, search_after))
+        self.assertTrue(torch.equal(fixed_before, fixed_after))
+        self.assertTrue(torch.equal(fixed_after, torch.ones_like(fixed_after)))
+
+    def test_validation_score_is_history_independent(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        registrar = MemoryGuidedRegistration(config())
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        inliers, residuals = registrar._verify(memory, pose)
+        before = registrar._validation_score(memory, inliers, residuals)
+        rank_before = memory.rank().clone()
+        memory.alpha.fill_(100.0)
+        memory.beta.fill_(0.1)
+        memory.edge_success.fill_(50.0)
+        memory.edge_failure.zero_()
+        support = torch.where(inliers)[0][:config().memory_support_max]
+        memory.update_basin(pose, memory.support_signature(support), before[0], improved=False, support_ids=support)
+        after = registrar._validation_score(memory, inliers, residuals)
+        self.assertFalse(torch.allclose(rank_before, memory.rank()))
+        self.assertAlmostEqual(before[0], after[0], places=8)
+        self.assertEqual(before[1], after[1])
+        self.assertAlmostEqual(before[2], after[2], places=8)
+        self.assertAlmostEqual(before[3], after[3], places=8)
+
+    def test_refinement_is_history_independent(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        target = target.clone()
+        target[0, :, 0] += torch.linspace(-0.002, 0.002, target.shape[1])
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        registrar = MemoryGuidedRegistration(config())
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        refined_before = registrar._robust_refine(memory, pose)
+        memory.alpha.copy_(torch.linspace(1.0, 100.0, memory.count))
+        memory.beta.copy_(torch.linspace(100.0, 1.0, memory.count))
+        refined_after = registrar._robust_refine(memory, pose)
+        self.assertTrue(torch.allclose(refined_before, refined_after, atol=1e-6, rtol=0.0))
+
+    def test_structure_penalty_cannot_change_selector(self):
+        pose = torch.eye(4)[None]
+        first = self.hypothesis(1, 1, pose, score=2.0, search_score=-100.0, structure_penalty=1e6)
+        second = self.hypothesis(2, 1, pose, score=1.0, search_score=1e6)
+        self.assertIs(MemoryGuidedRegistration._select_best([first, second]), first)
+        self.assertEqual(first.score, first.validation_score)
+
+    def test_basin_adjustment_cannot_change_selector(self):
+        pose = torch.eye(4)[None]
+        first = self.hypothesis(1, 1, pose, score=2.0, basin_adjustment=-1e6)
+        second = self.hypothesis(2, 1, pose, score=1.0, basin_adjustment=1e6)
+        self.assertIs(MemoryGuidedRegistration._select_best([first, second]), first)
+
+    def test_refinement_acceptance_uses_validation_score_only(self):
+        pose = torch.eye(4)[None]
+        registrar = MemoryGuidedRegistration(config())
+        parent = self.hypothesis(1, 1, pose, score=1.0, search_score=100.0)
+        better_validation = self.hypothesis(2, 1, pose, score=2.0, search_score=-100.0)
+        worse_validation = self.hypothesis(3, 1, pose, score=0.0, search_score=1e6)
+        self.assertTrue(registrar._accept_refined_child(parent, better_validation)[0])
+        self.assertFalse(registrar._accept_refined_child(parent, worse_validation)[0])
+
+    def test_same_support_produces_same_raw_pose_with_history_toggles(self):
+        source, target, source_features, target_features, _, _ = synthetic_pair()
+        full = CorrespondenceMemory(source, target, source_features, target_features, config())
+        no_history = CorrespondenceMemory(
+            source,
+            target,
+            source_features,
+            target_features,
+            config(memory_use_reliability=False, memory_use_relation_history=False, memory_use_basin=False),
+        )
+        support = torch.where(full.src_indices == full.tgt_indices)[0][:6]
+        full.alpha.fill_(100.0)
+        full.beta.fill_(0.1)
+        full.edge_success.fill_(25.0)
+        src_full, tgt_full = full.correspondence_points(support)
+        src_no_history, tgt_no_history = no_history.correspondence_points(support)
+        registrar = MemoryGuidedRegistration(config())
+        full_pose = registrar._weighted_rigid(src_full[0], tgt_full[0], full.fixed_estimation_weights(support))
+        no_history_pose = registrar._weighted_rigid(src_no_history[0], tgt_no_history[0], no_history.fixed_estimation_weights(support))
+        self.assertFalse(torch.allclose(full.rank(), no_history.rank()))
+        self.assertTrue(torch.allclose(full_pose, no_history_pose, atol=1e-7, rtol=0.0))
+
+    def test_signature_support_is_history_independent(self):
+        source, target, source_features, target_features, _, _ = synthetic_pair()
+        memory_config = config(memory_support_max=3)
+        memory = CorrespondenceMemory(source, target, source_features, target_features, memory_config)
+        registrar = MemoryGuidedRegistration(memory_config)
+        inliers = torch.ones(memory.count, dtype=torch.bool)
+        before = registrar._signature_support(memory, inliers)
+        memory.alpha.copy_(torch.linspace(1.0, 100.0, memory.count))
+        memory.beta.copy_(torch.linspace(100.0, 1.0, memory.count))
+        memory.edge_success.fill_(50.0)
+        after = registrar._signature_support(memory, inliers)
+        expected = torch.topk(memory.descriptor_score, k=memory_config.memory_support_max).indices
+        self.assertTrue(torch.equal(before, after))
+        self.assertTrue(torch.equal(after, expected))
+
+    def test_candidate_log_exposes_decoupled_scores(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        result = MemoryGuidedRegistration(config(memory_max_rounds=1)).run(
+            source,
+            target,
+            source_features,
+            target_features,
+            initial_pose=pose,
+        )
+        scored = [row for row in result.candidate_logs if row["stage"] in {"r1", "raw", "refinement_child"}]
+        required = {
+            "validation_score",
+            "search_score",
+            "inlier_count",
+            "mean_inlier_error",
+            "coverage",
+            "basin_adjustment",
+            "structure_penalty",
+        }
+        self.assertTrue(scored)
+        self.assertTrue(all(required.issubset(row) for row in scored))
+        self.assertTrue(all(row["score"] == row["validation_score"] for row in scored))
+        raw_by_id = {row["hypothesis_id"]: row for row in scored if row["stage"] == "raw"}
+        children = [row for row in scored if row["stage"] == "refinement_child"]
+        self.assertTrue(children)
+        self.assertTrue(all(row["search_score"] == raw_by_id[row["parent_id"]]["search_score"] for row in children))
 
     def test_static_graph_ranking_is_identical_with_history_disabled_before_updates(self):
         source, target, source_features, target_features, _, _ = synthetic_pair()

@@ -30,17 +30,25 @@ class MemoryHypothesis:
     support_ids: torch.Tensor
     inlier_ids: torch.Tensor
     residuals: torch.Tensor
-    score: float
-    evidence_score: float
+    validation_score: float
+    search_score: float
+    inlier_count: int
+    mean_inlier_error: float
+    coverage: float
     support_signature: torch.Tensor
     basin_key: tuple | None
     structure_penalty: float = 0.0
+    basin_adjustment: float = 0.0
     refinement_accepted: bool = False
     refinement_reject_reason: str = ""
 
     @property
     def pose(self):
         return self.pose_local_refined
+
+    @property
+    def score(self):
+        return self.validation_score
 
 
 @dataclass
@@ -51,6 +59,7 @@ class MemorySearchResult:
     r1_initialization: dict
     raw_hypotheses: list
     post_refinement_hypotheses: list
+    evaluated_hypotheses: list
     round_logs: list
     candidate_logs: list
     memory_summary: dict
@@ -88,13 +97,15 @@ class MemoryGuidedRegistration:
         return points @ matrix[:3, :3].transpose(0, 1) + matrix[:3, 3]
 
     def _robust_refine(self, memory, pose):
-        src, tgt = memory.correspondence_points(torch.arange(memory.count, device=memory.device))
+        all_ids = torch.arange(memory.count, device=memory.device)
+        src, tgt = memory.correspondence_points(all_ids)
         src, tgt = src[0], tgt[0]
         current = pose
+        fixed_weights = memory.fixed_estimation_weights(all_ids)
         for _ in range(self.config.memory_tls_iters):
             residuals = torch.linalg.norm(self._transform(src, current) - tgt, dim=1)
             truncated = (residuals < self.config.memory_tls_threshold).to(memory.dtype)
-            weights = memory.estimation_weights(torch.arange(memory.count, device=memory.device)) * truncated
+            weights = fixed_weights * truncated
             if int((weights > 0).sum().item()) < self.config.memory_support_min:
                 break
             current = self._weighted_rigid(src, tgt, weights)
@@ -112,32 +123,46 @@ class MemoryGuidedRegistration:
         voxels = torch.floor(points / self.config.memory_coverage_voxel_size).long()
         return float(torch.unique(voxels, dim=0).shape[0] / memory.source_voxel_count)
 
-    def _pose_score(self, memory, pose, inliers, residuals, signature):
+    def _validation_score(self, memory, inliers, residuals):
         inlier_ids = torch.where(inliers)[0]
-        inlier_weight = float(memory.estimation_weights(inlier_ids).sum().item())
-        mean_error = float(residuals[inliers].mean().item()) if inlier_ids.numel() else float("inf")
+        inlier_count = int(inlier_ids.numel())
+        if not inlier_count:
+            return float("-inf"), 0, float("inf"), 0.0
+        mean_error = float(residuals[inliers].mean().item())
         coverage = self._coverage(memory, inlier_ids)
-        basin_bonus = memory.basin_bonus(pose, signature)
-        evidence_score = (
-            self.config.memory_lambda_inlier * inlier_weight
+        validation_score = (
+            self.config.memory_lambda_inlier * float(inlier_count)
             - self.config.memory_lambda_error * mean_error
             + self.config.memory_lambda_coverage * coverage
         )
-        return float(evidence_score + basin_bonus), float(evidence_score), mean_error, coverage
+        return float(validation_score), inlier_count, mean_error, coverage
 
     def _signature_support(self, memory, inliers):
         candidate_ids = torch.where(inliers)[0]
         if candidate_ids.numel() <= self.config.memory_support_max:
             return candidate_ids
-        rank = memory.rank()[candidate_ids]
-        return candidate_ids[torch.topk(rank, k=self.config.memory_support_max).indices]
+        fixed_rank = memory.descriptor_score[candidate_ids]
+        return candidate_ids[torch.topk(fixed_rank, k=self.config.memory_support_max).indices]
 
-    def _make_hypothesis(self, memory, hypothesis_id, parent_id, round_id, stage, pose_raw, pose, support_ids, structure_penalty=0.0):
+    def _make_hypothesis(
+        self,
+        memory,
+        hypothesis_id,
+        parent_id,
+        round_id,
+        stage,
+        pose_raw,
+        pose,
+        support_ids,
+        search_score=0.0,
+        structure_penalty=0.0,
+    ):
         inliers, residuals = self._verify(memory, pose)
         signature_ids = support_ids if support_ids.numel() else self._signature_support(memory, inliers)
         signature = memory.support_signature(signature_ids)
-        score, evidence_score, _, _ = self._pose_score(memory, pose, inliers, residuals, signature)
+        validation_score, inlier_count, mean_error, coverage = self._validation_score(memory, inliers, residuals)
         basin_key = memory.basin_key(pose) if self.config.memory_use_basin else None
+        basin_adjustment = memory.basin_bonus(pose, signature)
         return MemoryHypothesis(
             hypothesis_id=hypothesis_id,
             parent_id=parent_id,
@@ -148,11 +173,15 @@ class MemoryGuidedRegistration:
             support_ids=support_ids,
             inlier_ids=torch.where(inliers)[0],
             residuals=residuals,
-            score=score - float(structure_penalty),
-            evidence_score=evidence_score,
+            validation_score=validation_score,
+            search_score=float(search_score),
+            inlier_count=inlier_count,
+            mean_inlier_error=mean_error,
+            coverage=coverage,
             support_signature=signature,
             basin_key=basin_key,
             structure_penalty=float(structure_penalty),
+            basin_adjustment=float(basin_adjustment),
         )
 
     def _prosac_seed(self, ranked, round_id, hypothesis_index):
@@ -162,16 +191,19 @@ class MemoryGuidedRegistration:
         offset = (hypothesis_index * 7919 + round_id * 104729) % prefix
         return int(ranked[offset].item())
 
-    def _strong_stop(self, hypothesis, coverage):
+    @staticmethod
+    def _select_best(hypotheses):
+        return max(hypotheses, key=lambda item: item.validation_score) if hypotheses else None
+
+    def _strong_stop(self, hypothesis):
         inlier_target = max(
             self.config.memory_strong_stop_min_inliers,
             int(math.ceil(self.config.memory_strong_stop_inlier_fraction * hypothesis.residuals.numel())),
         )
-        mean_error = float(hypothesis.residuals[hypothesis.inlier_ids].mean().item()) if hypothesis.inlier_ids.numel() else float("inf")
         return (
-            hypothesis.inlier_ids.numel() >= inlier_target
-            and mean_error <= self.config.memory_strong_stop_error_ratio * self.config.memory_inlier_threshold
-            and coverage >= self.config.memory_strong_stop_coverage
+            hypothesis.inlier_count >= inlier_target
+            and hypothesis.mean_inlier_error <= self.config.memory_strong_stop_error_ratio * self.config.memory_inlier_threshold
+            and hypothesis.coverage >= self.config.memory_strong_stop_coverage
         )
 
     @staticmethod
@@ -188,17 +220,15 @@ class MemoryGuidedRegistration:
             rotation <= self.config.memory_refine_trust_rotation_deg
             and translation <= self.config.memory_refine_trust_translation
         )
-        score_improved = child.evidence_score >= parent.evidence_score + self.config.memory_refine_min_score_improvement
+        score_improved = child.validation_score >= parent.validation_score + self.config.memory_refine_min_score_improvement
         if not within_trust_region:
             return False, "outside_trust_region"
         if not score_improved:
-            return False, "insufficient_evidence_improvement"
+            return False, "insufficient_validation_improvement"
         return True, ""
 
     @staticmethod
     def _candidate_log(hypothesis, seed_id, support_objective, accepted, reject_reason):
-        inlier_count = int(hypothesis.inlier_ids.numel())
-        mean_error = float(hypothesis.residuals[hypothesis.inlier_ids].mean().item()) if inlier_count else float("inf")
         return {
             "round_id": hypothesis.round_id,
             "hypothesis_id": hypothesis.hypothesis_id,
@@ -206,11 +236,14 @@ class MemoryGuidedRegistration:
             "stage": hypothesis.stage,
             "seed_id": seed_id,
             "support_count": int(hypothesis.support_ids.numel()),
-            "inlier_count": inlier_count,
-            "mean_inlier_error": mean_error,
+            "inlier_count": hypothesis.inlier_count,
+            "mean_inlier_error": hypothesis.mean_inlier_error,
+            "coverage": hypothesis.coverage,
             "score": hypothesis.score,
-            "evidence_score": hypothesis.evidence_score,
+            "validation_score": hypothesis.validation_score,
+            "search_score": hypothesis.search_score,
             "structure_penalty": hypothesis.structure_penalty,
+            "basin_adjustment": hypothesis.basin_adjustment,
             "basin_key": list(hypothesis.basin_key) if hypothesis.basin_key is not None else [],
             "support_objective": support_objective,
             "accepted": int(accepted),
@@ -236,7 +269,8 @@ class MemoryGuidedRegistration:
             initial_support_ids, mapping = memory.map_cached_indices(initial_src_indices, initial_tgt_indices)
             if mapping["r1_mapping_ratio"] < self.config.memory_r1_min_mapping_ratio:
                 raise RuntimeError(f"R1 direct index mapping ratio {mapping['r1_mapping_ratio']:.3f} is below {self.config.memory_r1_min_mapping_ratio:.3f}.")
-        raw_hypotheses, post_refinement_hypotheses, candidate_logs, round_logs = [], [], [], []
+        raw_hypotheses, post_refinement_hypotheses, evaluated_hypotheses = [], [], []
+        candidate_logs, round_logs = [], []
         next_id = 0
         r1_hypothesis = None
         r1_initialization = {
@@ -254,6 +288,7 @@ class MemoryGuidedRegistration:
             next_id += 1
             raw_hypotheses.append(r1_hypothesis)
             post_refinement_hypotheses.append(r1_hypothesis)
+            evaluated_hypotheses.append(r1_hypothesis)
             candidate_logs.append(self._candidate_log(r1_hypothesis, -1, 0.0, True, ""))
             if initial_support.numel():
                 support_inliers = torch.isin(initial_support, r1_hypothesis.inlier_ids)
@@ -272,7 +307,7 @@ class MemoryGuidedRegistration:
                     memory.update_basin(
                         r1_hypothesis.pose,
                         r1_hypothesis.support_signature,
-                        r1_hypothesis.score,
+                        r1_hypothesis.validation_score,
                         improved=False,
                         support_ids=initial_support,
                     )
@@ -289,7 +324,7 @@ class MemoryGuidedRegistration:
                     memory.update_basin(
                         r1_hypothesis.pose,
                         r1_hypothesis.support_signature,
-                        r1_hypothesis.score,
+                        r1_hypothesis.validation_score,
                         improved=True,
                         support_ids=initial_support,
                     )
@@ -302,15 +337,19 @@ class MemoryGuidedRegistration:
                     "r1_graph_delta": graph_delta,
                     **mapping,
                 }
-        best = max(post_refinement_hypotheses, key=lambda item: item.score) if post_refinement_hypotheses else None
+        best = self._select_best(post_refinement_hypotheses)
         if r1_hypothesis is not None:
             r1_coverage = self._coverage(memory, r1_hypothesis.inlier_ids)
             round_logs.append({
                 "round_id": 0,
                 "best_hypothesis_id": r1_hypothesis.hypothesis_id,
                 "best_score": r1_hypothesis.score,
+                "best_validation_score": r1_hypothesis.validation_score,
+                "best_search_score": r1_hypothesis.search_score,
                 "round_hypothesis_id": r1_hypothesis.hypothesis_id,
                 "round_score": r1_hypothesis.score,
+                "round_validation_score": r1_hypothesis.validation_score,
+                "round_search_score": r1_hypothesis.search_score,
                 "raw_candidate_count": 1,
                 "raw_generated": 0,
                 "accepted_child_count": 0,
@@ -374,7 +413,7 @@ class MemoryGuidedRegistration:
                     continue
                 src, tgt = memory.correspondence_points(support)
                 try:
-                    pose_raw = self._weighted_rigid(src[0], tgt[0], memory.estimation_weights(support))
+                    pose_raw = self._weighted_rigid(src[0], tgt[0], memory.fixed_estimation_weights(support))
                     if not bool(torch.isfinite(pose_raw).all()):
                         raise RuntimeError("weighted SVD returned a non-finite pose")
                 except RuntimeError:
@@ -393,11 +432,13 @@ class MemoryGuidedRegistration:
                     pose_raw,
                     pose_raw,
                     support,
+                    search_score=support_objective,
                     structure_penalty=structure_penalty,
                 )
                 next_id += 1
                 raw_hypotheses.append(raw)
                 post_refinement_hypotheses.append(raw)
+                evaluated_hypotheses.append(raw)
                 current_round.append(raw)
                 raw_generated += 1
                 candidate_logs.append({
@@ -423,9 +464,11 @@ class MemoryGuidedRegistration:
                     raw.pose_raw,
                     pose_refined,
                     support,
+                    search_score=support_objective,
                     structure_penalty=structure_penalty,
                 )
                 next_id += 1
+                evaluated_hypotheses.append(child)
                 accepted, reject_reason = self._accept_refined_child(raw, child)
                 raw.refinement_accepted = accepted
                 raw.refinement_reject_reason = reject_reason
@@ -446,8 +489,12 @@ class MemoryGuidedRegistration:
                     "round_id": round_id,
                     "best_hypothesis_id": best.hypothesis_id,
                     "best_score": best.score,
+                    "best_validation_score": best.validation_score,
+                    "best_search_score": best.search_score,
                     "round_hypothesis_id": best.hypothesis_id,
                     "round_score": float("-inf"),
+                    "round_validation_score": float("-inf"),
+                    "round_search_score": float("-inf"),
                     "raw_candidate_count": 0,
                     "raw_generated": 0,
                     "accepted_child_count": 0,
@@ -471,8 +518,8 @@ class MemoryGuidedRegistration:
                 if not self.config.memory_fixed_budget_mode and stale >= self.config.memory_patience:
                     break
                 continue
-            current = max(current_round, key=lambda item: item.score)
-            improved = best_before_round is None or current.score > best_before_round.score
+            current = self._select_best(current_round)
+            improved = best_before_round is None or current.validation_score > best_before_round.validation_score
             if improved:
                 best, stale = current, 0
             else:
@@ -481,19 +528,23 @@ class MemoryGuidedRegistration:
             inliers[current.inlier_ids] = True
             posterior_delta = memory.update_pair_posterior(current.support_ids, inliers)
             graph_delta = memory.update_relation_graph(current.support_ids, inliers, current.residuals)
-            memory.update_basin(current.pose, current.support_signature, current.score, improved, current.support_ids)
+            memory.update_basin(current.pose, current.support_signature, current.validation_score, improved, current.support_ids)
             memory.compress()
             current_coverage = self._coverage(memory, current.inlier_ids)
             best_coverage = self._coverage(memory, best.inlier_ids)
             rotation_delta, translation_delta = self._pose_distance(best.pose, best_before_round.pose) if best_before_round is not None else (float("inf"), float("inf"))
-            score_delta = float("inf") if best_before_round is None else abs(best.score - best_before_round.score) / max(abs(best_before_round.score), 1e-8)
+            score_delta = float("inf") if best_before_round is None else abs(best.validation_score - best_before_round.validation_score) / max(abs(best_before_round.validation_score), 1e-8)
             novelty = novel / max(1, sum(item.stage == "raw" for item in current_round)) if self.config.memory_use_basin else None
             round_logs.append({
                 "round_id": round_id,
                 "best_hypothesis_id": best.hypothesis_id,
                 "best_score": best.score,
+                "best_validation_score": best.validation_score,
+                "best_search_score": best.search_score,
                 "round_hypothesis_id": current.hypothesis_id,
                 "round_score": current.score,
+                "round_validation_score": current.validation_score,
+                "round_search_score": current.search_score,
                 "raw_candidate_count": sum(item.stage == "raw" for item in current_round),
                 "raw_generated": raw_generated,
                 "accepted_child_count": sum(item.stage == "refinement_child" for item in current_round),
@@ -514,7 +565,7 @@ class MemoryGuidedRegistration:
                 "round_runtime_seconds": time.perf_counter() - round_started,
                 **rejection_counts,
             })
-            if not self.config.memory_fixed_budget_mode and self._strong_stop(best, best_coverage):
+            if not self.config.memory_fixed_budget_mode and self._strong_stop(best):
                 break
             converged = (
                 stale >= self.config.memory_patience
@@ -529,5 +580,5 @@ class MemoryGuidedRegistration:
                 break
         if best is None:
             identity = torch.eye(4, dtype=memory.dtype, device=memory.device)[None]
-            return MemorySearchResult(identity, None, r1_hypothesis, r1_initialization, raw_hypotheses, post_refinement_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)
-        return MemorySearchResult(best.pose, best, r1_hypothesis, r1_initialization, raw_hypotheses, post_refinement_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)
+            return MemorySearchResult(identity, None, r1_hypothesis, r1_initialization, raw_hypotheses, post_refinement_hypotheses, evaluated_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)
+        return MemorySearchResult(best.pose, best, r1_hypothesis, r1_initialization, raw_hypotheses, post_refinement_hypotheses, evaluated_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)

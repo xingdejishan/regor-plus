@@ -1,0 +1,19 @@
+{
+  "base_config": "config_3DLoMatch_FPFH_redkitchen_modified.json",
+  "output_root": "./outputs/memory_graph_20_seed51_decoupled",
+  "top_level_overrides": {
+    "seed": 51,
+    "max_pairs": 20,
+    "r1_cache_dir": "./outputs/memory_graph_20_seed51/r1_cache"
+  },
+  "memory_overrides": {
+    "memory_hypotheses_per_round": 24,
+    "memory_max_rounds": 3,
+    "memory_max_sampling_attempts": 96,
+    "memory_fixed_budget_mode": true,
+    "memory_use_reliability": true,
+    "memory_use_relation_history": true,
+    "memory_use_basin": true,
+    "memory_require_r1_cache": true
+  }
+}

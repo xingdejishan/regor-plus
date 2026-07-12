@@ -429,7 +429,7 @@ def memory_prefix_audit(hypotheses, audits, round_id, rotation_threshold, transl
             item[1][te_key],
         ),
     )
-    selected_hypothesis, selected = max(eligible, key=lambda item: item[0].score)
+    selected_hypothesis, selected = max(eligible, key=lambda item: item[0].validation_score)
     success_rounds = [hypothesis.round_id for hypothesis, audit in eligible if audit[success_key]]
     return {
         "oracle_hypothesis_id": oracle_hypothesis.hypothesis_id,
@@ -524,7 +524,8 @@ def run_memory_graph_experiment(config, memory_config):
                 raise RuntimeError("memory_graph required R1 cache but no R1 archive parent was created.")
             raw_audits = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.raw_hypotheses]
             post_refinement_audits = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.post_refinement_hypotheses]
-            audits_by_id = {item.hypothesis_id: audit for item, audit in zip(result.post_refinement_hypotheses, post_refinement_audits)}
+            evaluated_audits = [audit_hypothesis(item, pair.gt_transform, config.re_thre, config.te_thre) for item in result.evaluated_hypotheses]
+            audits_by_id = {item.hypothesis_id: audit for item, audit in zip(result.evaluated_hypotheses, evaluated_audits)}
             for row in result.candidate_logs:
                 audit = audits_by_id.get(row["hypothesis_id"], {})
                 candidate_rows.append({"pair_id": pair.pair_id, **row, **audit})

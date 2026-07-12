@@ -133,8 +133,16 @@ class CorrespondenceMemory:
     def reliability(self):
         return self.posterior_reliability if self.config.memory_use_reliability else torch.ones(self.count, dtype=self.dtype, device=self.device)
 
-    def estimation_weights(self, candidate_ids):
+    def search_reliability(self, candidate_ids):
+        candidate_ids = torch.as_tensor(candidate_ids, dtype=torch.long, device=self.device)
         return self.reliability[candidate_ids]
+
+    def fixed_estimation_weights(self, candidate_ids):
+        candidate_ids = torch.as_tensor(candidate_ids, dtype=torch.long, device=self.device)
+        return torch.ones(candidate_ids.numel(), dtype=self.dtype, device=self.device)
+
+    def estimation_weights(self, candidate_ids):
+        return self.fixed_estimation_weights(candidate_ids)
 
     def edge_weight(self):
         return self.static_geometry + self.config.memory_lambda_edge_success * torch.log1p(self.edge_success) - self.config.memory_lambda_edge_failure * torch.log1p(self.edge_failure)
