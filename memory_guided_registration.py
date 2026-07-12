@@ -37,6 +37,9 @@ class MemoryHypothesis:
     coverage: float
     support_signature: torch.Tensor
     basin_key: tuple | None
+    unique_inlier_ratio: float = 0.0
+    median_residual: float = float("inf")
+    bidirectional_consistency: float = 0.0
     structure_penalty: float = 0.0
     basin_adjustment: float = 0.0
     refinement_accepted: bool = False
@@ -96,7 +99,7 @@ class MemoryGuidedRegistration:
         matrix = pose[0] if pose.ndim == 3 else pose
         return points @ matrix[:3, :3].transpose(0, 1) + matrix[:3, 3]
 
-    def _robust_refine(self, memory, pose):
+    def _robust_refine(self, memory, pose, use_one_to_one=True):
         all_ids = torch.arange(memory.count, device=memory.device)
         src, tgt = memory.correspondence_points(all_ids)
         src, tgt = src[0], tgt[0]
@@ -106,15 +109,95 @@ class MemoryGuidedRegistration:
             residuals = torch.linalg.norm(self._transform(src, current) - tgt, dim=1)
             truncated = (residuals < self.config.memory_tls_threshold).to(memory.dtype)
             weights = fixed_weights * truncated
+            active_ids = torch.where(weights > 0)[0]
+            if use_one_to_one and active_ids.numel() > 0:
+                unique_ids = memory.one_to_one_filter(active_ids)
+                unique_weights = torch.zeros_like(weights)
+                unique_weights[unique_ids] = weights[unique_ids]
+                weights = unique_weights
             if int((weights > 0).sum().item()) < self.config.memory_support_min:
                 break
             current = self._weighted_rigid(src, tgt, weights)
         return current
 
     def _verify(self, memory, pose):
+        """Verify pose using one-to-one filtered correspondences.
+
+        Returns (unique_inliers, residuals, all_inlier_ids).
+        """
         src, tgt = memory.correspondence_points(torch.arange(memory.count, device=memory.device))
         residuals = torch.linalg.norm(self._transform(src[0], pose) - tgt[0], dim=1)
-        return residuals < self.config.memory_inlier_threshold, residuals
+        inlier_mask = residuals < self.config.memory_inlier_threshold
+        inlier_ids = torch.where(inlier_mask)[0]
+        if inlier_ids.numel() == 0:
+            unique_inliers = torch.zeros(memory.count, dtype=torch.bool, device=memory.device)
+            return unique_inliers, residuals, inlier_ids
+        unique_support = memory.one_to_one_filter(inlier_ids)
+        unique_inliers = torch.zeros(memory.count, dtype=torch.bool, device=memory.device)
+        unique_inliers[unique_support] = True
+        return unique_inliers, residuals, inlier_ids
+
+    def _one_to_one_match(self, memory, candidate_ids):
+        """Apply one-to-one filter to candidate correspondence IDs."""
+        return memory.one_to_one_filter(candidate_ids)
+
+    def _vdce_validation_score(self, memory, unique_inliers, residuals, pose=None):
+        """Independent validation score using unique inlier ratio.
+
+        Uses normalized metrics:
+        - unique_inlier_ratio: one-to-one inliers / visible source points
+        - normalized_median_residual: median residual / normalize scale
+        - spatial_coverage: voxel coverage of inlier source points
+        - bidirectional_consistency: forward/backward transform agreement
+        """
+        inlier_ids = torch.where(unique_inliers)[0]
+        unique_count = int(inlier_ids.numel())
+        if not unique_count:
+            return float("-inf"), 0, float("inf"), 0.0, 0.0, 0.0
+        visible_sources = int(torch.unique(memory.src_indices[inlier_ids]).numel()) if unique_count else 0
+        if visible_sources == 0:
+            return float("-inf"), 0, float("inf"), 0.0, 0.0, 0.0
+        unique_inlier_ratio = unique_count / max(1, visible_sources)
+        median_residual = float(residuals[inlier_ids].median().item())
+        normalized_residual = median_residual / self.config.memory_vdce_normalize_residual_scale
+        coverage = self._coverage(memory, inlier_ids)
+        bidirectional = 0.0
+        if pose is not None:
+            src_pts = memory.src_points[memory.src_indices[inlier_ids]]
+            tgt_pts = memory.tgt_points[memory.tgt_indices[inlier_ids]]
+            forward = self._transform(src_pts, pose)
+            reverse = self._transform(tgt_pts, self._invert_pose(pose))
+            forward_error = torch.linalg.norm(forward - tgt_pts, dim=1).mean()
+            reverse_error = torch.linalg.norm(reverse - src_pts, dim=1).mean()
+            scale = torch.linalg.norm(src_pts.mean(dim=0) - tgt_pts.mean(dim=0)).clamp_min(1e-8)
+            bidirectional = float(torch.exp(-(forward_error + reverse_error) / (2.0 * scale)).item())
+        w = self.config
+        score = (
+            w.memory_vdce_w_r * unique_inlier_ratio
+            - w.memory_vdce_w_e * min(normalized_residual, 1.0)
+            + w.memory_vdce_w_c * coverage
+            + w.memory_vdce_w_b * bidirectional
+        )
+        return float(score), unique_count, median_residual, coverage, unique_inlier_ratio, bidirectional
+
+    def _invert_pose(self, pose):
+        matrix = pose[0] if pose.ndim == 3 else pose
+        inv = torch.eye(4, dtype=matrix.dtype, device=matrix.device)
+        inv[:3, :3] = matrix[:3, :3].transpose(0, 1)
+        inv[:3, 3] = -inv[:3, :3] @ matrix[:3, 3]
+        return inv[None]
+
+    def _memory_update_gate(self, current_eval, best_eval):
+        """Gate memory updates: only accept if significantly better than global best."""
+        if best_eval is None:
+            return True
+        score_gain = current_eval.validation_score - best_eval.validation_score
+        return (
+            score_gain > self.config.memory_vdce_min_score_margin
+            and current_eval.unique_inlier_ratio > self.config.memory_vdce_min_inlier_ratio
+            and current_eval.coverage > self.config.memory_vdce_min_coverage
+            and current_eval.median_residual < self.config.memory_vdce_max_median_residual
+        )
 
     def _coverage(self, memory, candidate_ids):
         if candidate_ids.numel() == 0:
@@ -157,10 +240,14 @@ class MemoryGuidedRegistration:
         search_score=0.0,
         structure_penalty=0.0,
     ):
-        inliers, residuals = self._verify(memory, pose)
-        signature_ids = support_ids if support_ids.numel() else self._signature_support(memory, inliers)
+        unique_inliers, residuals, all_inlier_ids = self._verify(memory, pose)
+        signature_ids = support_ids if support_ids.numel() else self._signature_support(memory, unique_inliers)
         signature = memory.support_signature(signature_ids)
-        validation_score, inlier_count, mean_error, coverage = self._validation_score(memory, inliers, residuals)
+        vdce_score, unique_inlier_count, median_residual, coverage, unique_inlier_ratio, bidirectional = self._vdce_validation_score(
+            memory, unique_inliers, residuals, pose,
+        )
+        validation_score = vdce_score
+        mean_error = float(residuals[unique_inliers].mean().item()) if unique_inliers.any() else float("inf")
         basin_key = memory.basin_key(pose) if self.config.memory_use_basin else None
         basin_adjustment = memory.basin_bonus(pose, signature)
         return MemoryHypothesis(
@@ -171,13 +258,16 @@ class MemoryGuidedRegistration:
             pose_raw=pose_raw,
             pose_local_refined=pose,
             support_ids=support_ids,
-            inlier_ids=torch.where(inliers)[0],
+            inlier_ids=torch.where(unique_inliers)[0],
             residuals=residuals,
             validation_score=validation_score,
             search_score=float(search_score),
-            inlier_count=inlier_count,
+            inlier_count=unique_inlier_count,
             mean_inlier_error=mean_error,
             coverage=coverage,
+            unique_inlier_ratio=unique_inlier_ratio,
+            median_residual=median_residual,
+            bidirectional_consistency=bidirectional,
             support_signature=signature,
             basin_key=basin_key,
             structure_penalty=float(structure_penalty),
@@ -524,11 +614,21 @@ class MemoryGuidedRegistration:
                 best, stale = current, 0
             else:
                 stale += 1
-            inliers = torch.zeros(memory.count, dtype=torch.bool, device=memory.device)
-            inliers[current.inlier_ids] = True
-            posterior_delta = memory.update_pair_posterior(current.support_ids, inliers)
-            graph_delta = memory.update_relation_graph(current.support_ids, inliers, current.residuals)
-            memory.update_basin(current.pose, current.support_signature, current.validation_score, improved, current.support_ids)
+            memory_accepted = self._memory_update_gate(current, best_before_round)
+            posterior_delta, graph_delta = 0.0, 0.0
+            expansion_count = 0
+            if memory_accepted and improved:
+                inliers = torch.zeros(memory.count, dtype=torch.bool, device=memory.device)
+                inliers[current.inlier_ids] = True
+                posterior_delta = memory.update_pair_posterior(current.support_ids, inliers)
+                graph_delta = memory.update_relation_graph(current.support_ids, inliers, current.residuals)
+                memory.update_basin(current.pose, current.support_signature, current.validation_score, improved=True, support_ids=current.support_ids)
+                new_src, new_tgt, new_scores = memory.pose_guided_candidate_expansion(
+                    current.pose, src_features, tgt_features,
+                )
+                expansion_count = memory.add_candidates(new_src, new_tgt, new_scores)
+            else:
+                memory.update_basin(current.pose, current.support_signature, current.validation_score, improved=False, support_ids=current.support_ids)
             memory.compress()
             current_coverage = self._coverage(memory, current.inlier_ids)
             best_coverage = self._coverage(memory, best.inlier_ids)
@@ -560,6 +660,8 @@ class MemoryGuidedRegistration:
                 "novelty": novelty,
                 "posterior_delta": posterior_delta,
                 "graph_delta": graph_delta,
+                "memory_accepted": int(memory_accepted),
+                "candidate_expansion_count": expansion_count,
                 "basin_count": len(memory.basins),
                 "stale_rounds": stale,
                 "round_runtime_seconds": time.perf_counter() - round_started,

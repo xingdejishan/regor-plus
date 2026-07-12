@@ -154,6 +154,21 @@
     "memory_use_reliability": true,
     "memory_use_relation_history": true,
     "memory_use_basin": true,
-    "memory_require_r1_cache": true
+    "memory_require_r1_cache": true,
+    "memory_vdce_w_r": 0.45,
+    "memory_vdce_w_e": 0.2,
+    "memory_vdce_w_c": 0.15,
+    "memory_vdce_w_b": 0.1,
+    "memory_vdce_w_f": 0.1,
+    "memory_vdce_normalize_residual_scale": 0.1,
+    "memory_vdce_min_score_margin": 0.01,
+    "memory_vdce_min_inlier_ratio": 0.05,
+    "memory_vdce_min_coverage": 0.01,
+    "memory_vdce_max_median_residual": 0.5,
+    "memory_vdce_max_conflict_ratio": 0.3,
+    "memory_vdce_expand_radius": 0.15,
+    "memory_vdce_expand_max_per_source": 3,
+    "memory_vdce_expand_max_total": 64,
+    "memory_vdce_expand_descriptor_threshold": 0.3
   }
 }

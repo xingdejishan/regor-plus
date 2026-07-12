@@ -79,6 +79,24 @@ class MemoryGraphConfig:
     memory_use_relation_history: bool = True
     memory_use_basin: bool = True
     memory_require_r1_cache: bool = True
+    # VDCE independent validation weights
+    memory_vdce_w_r: float = 0.45
+    memory_vdce_w_e: float = 0.20
+    memory_vdce_w_c: float = 0.15
+    memory_vdce_w_b: float = 0.10
+    memory_vdce_w_f: float = 0.10
+    memory_vdce_normalize_residual_scale: float = 0.10
+    # VDCE memory update gating
+    memory_vdce_min_score_margin: float = 0.01
+    memory_vdce_min_inlier_ratio: float = 0.05
+    memory_vdce_min_coverage: float = 0.01
+    memory_vdce_max_median_residual: float = 0.50
+    memory_vdce_max_conflict_ratio: float = 0.30
+    # VDCE pose-guided candidate expansion
+    memory_vdce_expand_radius: float = 0.15
+    memory_vdce_expand_max_per_source: int = 3
+    memory_vdce_expand_max_total: int = 64
+    memory_vdce_expand_descriptor_threshold: float = 0.30
 
     @classmethod
     def from_mapping(cls, values):
@@ -141,6 +159,28 @@ class MemoryGraphConfig:
             raise ValueError("memory strong-stop configuration is invalid.")
         if not self.memory_require_r1_cache:
             raise ValueError("memory_graph requires fixed R1 cache for fair repair evaluation.")
+        if min(self.memory_vdce_w_r, self.memory_vdce_w_e, self.memory_vdce_w_c, self.memory_vdce_w_b, self.memory_vdce_w_f) < 0:
+            raise ValueError("memory VDCE validation weights must be non-negative.")
+        if self.memory_vdce_normalize_residual_scale <= 0:
+            raise ValueError("memory VDCE residual normalization scale must be positive.")
+        if self.memory_vdce_min_score_margin < 0:
+            raise ValueError("memory VDCE min score margin must be non-negative.")
+        if not 0 <= self.memory_vdce_min_inlier_ratio <= 1:
+            raise ValueError("memory VDCE min inlier ratio must be in [0, 1].")
+        if not 0 <= self.memory_vdce_min_coverage <= 1:
+            raise ValueError("memory VDCE min coverage must be in [0, 1].")
+        if self.memory_vdce_max_median_residual <= 0:
+            raise ValueError("memory VDCE max median residual must be positive.")
+        if not 0 <= self.memory_vdce_max_conflict_ratio <= 1:
+            raise ValueError("memory VDCE max conflict ratio must be in [0, 1].")
+        if self.memory_vdce_expand_radius <= 0:
+            raise ValueError("memory VDCE expand radius must be positive.")
+        if self.memory_vdce_expand_max_per_source < 1:
+            raise ValueError("memory VDCE expand max per source must be at least 1.")
+        if self.memory_vdce_expand_max_total < 1:
+            raise ValueError("memory VDCE expand max total must be at least 1.")
+        if not 0 < self.memory_vdce_expand_descriptor_threshold <= 1:
+            raise ValueError("memory VDCE expand descriptor threshold must be in (0, 1].")
         return self
 
     def report(self):

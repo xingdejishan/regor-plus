@@ -228,16 +228,16 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         registrar = MemoryGuidedRegistration(config())
         pose = torch.eye(4)[None]
         pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
-        inliers, residuals = registrar._verify(memory, pose)
-        before = registrar._validation_score(memory, inliers, residuals)
+        unique_inliers, residuals, all_inlier_ids = registrar._verify(memory, pose)
+        before = registrar._vdce_validation_score(memory, unique_inliers, residuals, pose)
         rank_before = memory.rank().clone()
         memory.alpha.fill_(100.0)
         memory.beta.fill_(0.1)
         memory.edge_success.fill_(50.0)
         memory.edge_failure.zero_()
-        support = torch.where(inliers)[0][:config().memory_support_max]
+        support = torch.where(unique_inliers)[0][:config().memory_support_max]
         memory.update_basin(pose, memory.support_signature(support), before[0], improved=False, support_ids=support)
-        after = registrar._validation_score(memory, inliers, residuals)
+        after = registrar._vdce_validation_score(memory, unique_inliers, residuals, pose)
         self.assertFalse(torch.allclose(rank_before, memory.rank()))
         self.assertAlmostEqual(before[0], after[0], places=8)
         self.assertEqual(before[1], after[1])
@@ -435,6 +435,137 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         self.assertEqual(after["cumulative_raw_oracle_success"], 1)
         self.assertEqual(after["cumulative_post_refinement_oracle_success"], 1)
         self.assertNotIn(rejected_child.hypothesis_id, {item.hypothesis_id for item in result.post_refinement_hypotheses})
+
+    def test_one_to_one_filter_removes_duplicate_sources_and_targets(self):
+        source, target, source_features, target_features, _, _ = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        candidates = torch.arange(6)
+        filtered = memory.one_to_one_filter(candidates)
+        self.assertEqual(int(torch.unique(memory.src_indices[filtered]).numel()), filtered.numel())
+        self.assertEqual(int(torch.unique(memory.tgt_indices[filtered]).numel()), filtered.numel())
+        self.assertLessEqual(filtered.numel(), candidates.numel())
+
+    def test_one_to_one_filter_orders_by_descriptor_score(self):
+        source, target, source_features, target_features, _, _ = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        candidates = torch.arange(6)
+        filtered = memory.one_to_one_filter(candidates)
+        scores = memory.descriptor_score[filtered]
+        self.assertTrue(torch.equal(scores, torch.sort(scores, descending=True).values))
+
+    def test_vdce_validation_score_uses_unique_inlier_ratio(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        registrar = MemoryGuidedRegistration(config())
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        unique_inliers, residuals, _ = registrar._verify(memory, pose)
+        score, count, med_res, coverage, ratio, bidir = registrar._vdce_validation_score(
+            memory, unique_inliers, residuals, pose,
+        )
+        self.assertGreater(score, 0.0)
+        self.assertGreater(count, 0)
+        self.assertLessEqual(ratio, 1.0)
+        self.assertGreater(ratio, 0.0)
+
+    def test_memory_update_gate_blocks_marginally_better_pose(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        registrar = MemoryGuidedRegistration(config())
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        best = registrar._make_hypothesis(memory, 0, -1, 0, "r1", pose, pose, torch.arange(6))
+        current = registrar._make_hypothesis(memory, 1, 0, 1, "raw", pose, pose, torch.arange(6))
+        current.validation_score = best.validation_score + 0.001
+        self.assertFalse(registrar._memory_update_gate(current, best))
+
+    def test_memory_update_gate_accepts_significantly_better_pose(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        registrar = MemoryGuidedRegistration(config())
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        best = registrar._make_hypothesis(memory, 0, -1, 0, "r1", pose, pose, torch.arange(6))
+        current = registrar._make_hypothesis(memory, 1, 0, 1, "raw", pose, pose, torch.arange(6))
+        current.validation_score = best.validation_score + 2.0
+        current.unique_inlier_ratio = 0.3
+        current.coverage = 0.2
+        current.median_residual = 0.01
+        self.assertTrue(registrar._memory_update_gate(current, best))
+
+    def test_memory_update_gate_blocks_low_quality_pose(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        registrar = MemoryGuidedRegistration(config(
+            memory_vdce_min_inlier_ratio=0.5,
+            memory_vdce_min_coverage=0.3,
+        ))
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        best = registrar._make_hypothesis(memory, 0, -1, 0, "r1", pose, pose, torch.arange(6))
+        current = registrar._make_hypothesis(memory, 1, 0, 1, "raw", pose, pose, torch.arange(6))
+        current.validation_score = best.validation_score + 2.0
+        current.unique_inlier_ratio = 0.01
+        current.coverage = 0.01
+        self.assertFalse(registrar._memory_update_gate(current, best))
+
+    def test_graph_is_bidirectional(self):
+        source, target, source_features, target_features, _, _ = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        failures = memory.check_graph_symmetry()
+        self.assertEqual(failures, 0)
+
+    def test_candidate_expansion_adds_new_candidates(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        original_count = memory.count
+        new_src, new_tgt, new_scores = memory.pose_guided_candidate_expansion(
+            pose, source_features, target_features,
+        )
+        added = memory.add_candidates(new_src, new_tgt, new_scores)
+        self.assertGreaterEqual(memory.count, original_count)
+        self.assertEqual(memory.count, original_count + added)
+        self.assertEqual(memory.check_graph_symmetry(), 0)
+
+    def test_validation_score_normalized_to_zero_one_range(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        registrar = MemoryGuidedRegistration(config())
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        unique_inliers, residuals, _ = registrar._verify(memory, pose)
+        score, *_ = registrar._vdce_validation_score(memory, unique_inliers, residuals, pose)
+        self.assertLessEqual(score, 1.0)
+        self.assertGreaterEqual(score, -1.0)
+
+    def test_round_logs_include_memory_accept_and_expansion_fields(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        r1_pose = torch.eye(4)[None]
+        r1_pose[0, :3, :3], r1_pose[0, :3, 3] = rotation, translation
+        result = MemoryGuidedRegistration(config(memory_max_rounds=1)).run(
+            source, target, source_features, target_features,
+            initial_pose=r1_pose,
+            initial_src_indices=torch.arange(6),
+            initial_tgt_indices=torch.arange(6),
+        )
+        for row in result.round_logs:
+            if row["round_id"] > 0:
+                self.assertIn("memory_accepted", row)
+                self.assertIn("candidate_expansion_count", row)
+
+    def test_robust_refine_uses_one_to_one_matching(self):
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        target = target.clone()
+        target[0, :, 0] += torch.linspace(-0.002, 0.002, target.shape[1])
+        memory = CorrespondenceMemory(source, target, source_features, target_features, config())
+        registrar = MemoryGuidedRegistration(config())
+        pose = torch.eye(4)[None]
+        pose[0, :3, :3], pose[0, :3, 3] = rotation, translation
+        refined = registrar._robust_refine(memory, pose, use_one_to_one=True)
+        self.assertTrue(torch.isfinite(refined).all())
+        self.assertEqual(refined.shape, (1, 4, 4))
 
 
 if __name__ == "__main__":
