@@ -31,6 +31,7 @@ class CorrespondenceMemory:
         self.topk = int(self.topk_descriptor_scores.shape[1])
         self._src_to_candidate_ids = self._build_candidate_index(self.src_indices)
         self._tgt_to_candidate_ids = self._build_candidate_index(self.tgt_indices)
+        self._pair_to_candidate_id = self._build_pair_index(self.src_indices, self.tgt_indices)
         self.alpha = config.memory_alpha0 + config.memory_descriptor_prior * self.descriptor_score
         self.beta = torch.full_like(self.alpha, float(config.memory_beta0))
         self.source_voxel_count = max(1, int(torch.unique(torch.floor(self.src_points / config.memory_coverage_voxel_size).long(), dim=0).shape[0]))
@@ -102,26 +103,54 @@ class CorrespondenceMemory:
             index.setdefault(int(point_id), []).append(candidate_id)
         return index
 
+    @staticmethod
+    def _build_pair_index(src_indices, tgt_indices):
+        return {
+            (int(src_id), int(tgt_id)): candidate_id
+            for candidate_id, (src_id, tgt_id) in enumerate(zip(src_indices.tolist(), tgt_indices.tolist()))
+        }
+
+    def candidate_ids_for_pairs(self, source_ids, target_ids):
+        source_ids = torch.as_tensor(source_ids, dtype=torch.long, device=self.device).reshape(-1)
+        target_ids = torch.as_tensor(target_ids, dtype=torch.long, device=self.device).reshape(-1)
+        if source_ids.numel() != target_ids.numel():
+            raise ValueError("Source and target pair index counts must match.")
+        candidate_ids = [
+            self._pair_to_candidate_id[(int(source_id), int(target_id))]
+            for source_id, target_id in zip(source_ids.tolist(), target_ids.tolist())
+            if (int(source_id), int(target_id)) in self._pair_to_candidate_id
+        ]
+        return torch.tensor(candidate_ids, dtype=torch.long, device=self.device)
+
     def _build_relation_graph(self):
         source_count = int(self.src_points.shape[0])
-        topk = self.topk
         if source_count < 2 or self.count == 0:
             empty_long = torch.empty(0, dtype=torch.long, device=self.device)
             return empty_long, empty_long, torch.empty(0, dtype=self.dtype, device=self.device), torch.zeros(self.count + 1, dtype=torch.long, device=self.device)
-        source_neighbors = min(source_count - 1, max(1, math.ceil(self.config.memory_graph_neighbors / topk)))
+        max_candidates = max(len(ids) for ids in self._src_to_candidate_ids.values())
+        source_neighbors = min(source_count - 1, max(1, math.ceil(self.config.memory_graph_neighbors / max_candidates)))
         source_distance = torch.cdist(self.src_points, self.src_points)
         source_distance.fill_diagonal_(float("inf"))
         _, neighbors = torch.topk(source_distance, k=source_neighbors, dim=1, largest=False)
-        ranks = torch.arange(topk, device=self.device, dtype=torch.long)
-        neighbor_nodes = (neighbors[:, :, None] * topk + ranks[None, None, :]).reshape(source_count, -1)
+        candidate_table = torch.full(
+            (source_count, max_candidates),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for source_id, candidate_ids in self._src_to_candidate_ids.items():
+            candidate_table[source_id, :len(candidate_ids)] = torch.tensor(candidate_ids, dtype=torch.long, device=self.device)
+        neighbor_nodes = candidate_table[neighbors].reshape(source_count, -1)
         candidate_sources = self.src_indices
         local_nodes = neighbor_nodes[candidate_sources]
-        local_targets = self.tgt_indices[local_nodes]
-        local_sources = self.src_indices[local_nodes]
+        valid_nodes = local_nodes >= 0
+        safe_local_nodes = local_nodes.clamp_min(0)
+        local_targets = self.tgt_indices[safe_local_nodes]
+        local_sources = self.src_indices[safe_local_nodes]
         source_gap = torch.linalg.norm(self.src_points[candidate_sources, None] - self.src_points[local_sources], dim=-1)
         target_gap = torch.linalg.norm(self.tgt_points[self.tgt_indices, None] - self.tgt_points[local_targets], dim=-1)
         geometry = torch.exp(-((source_gap - target_gap) ** 2) / (2.0 * self.config.memory_sigma_g ** 2))
-        valid = (self.tgt_indices[:, None] != local_targets) & (geometry > self.config.memory_tau_g)
+        valid = valid_nodes & (safe_local_nodes != torch.arange(self.count, device=self.device)[:, None]) & (self.tgt_indices[:, None] != local_targets) & (geometry > self.config.memory_tau_g)
         geometry = torch.where(valid, geometry, torch.full_like(geometry, float("-inf")))
         take = min(int(self.config.memory_graph_neighbors), int(geometry.shape[1]))
         values, positions = torch.topk(geometry, k=take, dim=1)
@@ -141,6 +170,29 @@ class CorrespondenceMemory:
         counts = torch.bincount(edge_rows, minlength=self.count)
         row_ptr = torch.cat([torch.zeros(1, dtype=torch.long, device=self.device), counts.cumsum(0)])
         return edge_rows, edge_cols, static, row_ptr
+
+    def _rebuild_relation_graph_preserving_history(self):
+        old_rows = self.edge_rows
+        old_cols = self.edge_cols
+        old_success = self.edge_success
+        old_failure = self.edge_failure
+        self.edge_rows, self.edge_cols, self.static_geometry, self.row_ptr = self._build_relation_graph()
+        self.edge_success = torch.zeros_like(self.static_geometry)
+        self.edge_failure = torch.zeros_like(self.static_geometry)
+        if old_rows.numel() == 0 or self.edge_rows.numel() == 0:
+            return
+        stride = int(self.count)
+        old_keys = old_rows.to(torch.long) * stride + old_cols.to(torch.long)
+        new_keys = self.edge_rows.to(torch.long) * stride + self.edge_cols.to(torch.long)
+        sorted_old_keys, old_order = torch.sort(old_keys)
+        positions = torch.searchsorted(sorted_old_keys, new_keys)
+        in_bounds = positions < sorted_old_keys.numel()
+        valid = torch.zeros_like(in_bounds)
+        valid[in_bounds] = sorted_old_keys[positions[in_bounds]] == new_keys[in_bounds]
+        if bool(valid.any()):
+            old_indices = old_order[positions[valid]]
+            self.edge_success[valid] = old_success[old_indices]
+            self.edge_failure[valid] = old_failure[old_indices]
 
     @property
     def posterior_reliability(self):
@@ -469,30 +521,39 @@ class CorrespondenceMemory:
         )
         self._negative_basin_supports = [record.support_ids.to(device=self.device) for record in records]
 
-    def update_pair_posterior(self, support, inliers):
+    def update_pair_posterior(self, verified_inliers, verified_outliers):
         if not self.config.memory_use_reliability:
             return 0.0
+        verified_inliers = torch.as_tensor(verified_inliers, dtype=torch.long, device=self.device).unique()
+        verified_outliers = torch.as_tensor(verified_outliers, dtype=torch.long, device=self.device).unique()
         previous = self.posterior_reliability.clone()
         self.alpha.mul_(self.config.memory_forgetting)
         self.beta.mul_(self.config.memory_forgetting)
-        self.alpha[inliers] += self.config.memory_eta_positive
-        support_failures = support[~inliers[support]]
-        if support_failures.numel():
-            self.beta[support_failures] += self.config.memory_eta_negative
+        if verified_inliers.numel():
+            self.alpha[verified_inliers] += self.config.memory_eta_positive
+        if verified_outliers.numel():
+            self.beta[verified_outliers] += self.config.memory_eta_negative
         self.alpha.clamp_(max=self.config.memory_evidence_cap)
         self.beta.clamp_(max=self.config.memory_evidence_cap)
         return float(torch.mean(torch.abs(self.posterior_reliability - previous)).item())
 
-    def update_relation_graph(self, support, inliers, residuals):
+    def update_relation_graph(self, verified_inliers, verified_outliers):
         if self.edge_rows.numel() == 0 or not self.config.memory_use_relation_history:
             return 0.0
+        verified_inliers = torch.as_tensor(verified_inliers, dtype=torch.long, device=self.device).unique()
+        verified_outliers = torch.as_tensor(verified_outliers, dtype=torch.long, device=self.device).unique()
         self.edge_success.mul_(self.config.memory_forgetting)
         self.edge_failure.mul_(self.config.memory_forgetting)
         active_nodes = torch.zeros(self.count, dtype=torch.bool, device=self.device)
-        active_nodes[support] = True
+        active_nodes[verified_inliers] = True
+        active_nodes[verified_outliers] = True
+        inlier_nodes = torch.zeros(self.count, dtype=torch.bool, device=self.device)
+        outlier_nodes = torch.zeros(self.count, dtype=torch.bool, device=self.device)
+        inlier_nodes[verified_inliers] = True
+        outlier_nodes[verified_outliers] = True
         active_edges = active_nodes[self.edge_rows] & active_nodes[self.edge_cols]
-        success = active_edges & inliers[self.edge_rows] & inliers[self.edge_cols]
-        failure = active_edges & ((residuals[self.edge_rows] >= self.config.memory_inlier_threshold) | (residuals[self.edge_cols] >= self.config.memory_inlier_threshold))
+        success = active_edges & inlier_nodes[self.edge_rows] & inlier_nodes[self.edge_cols]
+        failure = active_edges & (outlier_nodes[self.edge_rows] | outlier_nodes[self.edge_cols])
         self.edge_success[success] += self.config.memory_eta_edge_positive
         self.edge_failure[failure] += self.config.memory_eta_edge_negative
         self.edge_success.clamp_(max=self.config.memory_evidence_cap)
@@ -520,15 +581,18 @@ class CorrespondenceMemory:
         self._refresh_negative_basin_cache()
         return key, record
 
-    def one_to_one_filter(self, candidate_ids):
-        """Greedy one-to-one correspondence filter by descriptor score.
-
-        Returns candidate_ids with at most one correspondence per source
-        and target point, ordered by descending descriptor score.
-        """
+    def one_to_one_filter(self, candidate_ids, residuals=None):
         if candidate_ids.numel() == 0:
             return candidate_ids
-        sorted_order = torch.argsort(self.descriptor_score[candidate_ids], descending=True)
+        candidate_ids = torch.as_tensor(candidate_ids, dtype=torch.long, device=self.device).reshape(-1)
+        if residuals is None:
+            sorted_order = torch.argsort(self.descriptor_score[candidate_ids], descending=True)
+        else:
+            residuals = torch.as_tensor(residuals, dtype=self.dtype, device=self.device)
+            values = residuals[candidate_ids] if residuals.numel() == self.count else residuals
+            if values.numel() != candidate_ids.numel():
+                raise ValueError("Validation residuals must align with candidate_ids or the full candidate pool.")
+            sorted_order = torch.argsort(values, descending=False, stable=True)
         sorted_ids = candidate_ids[sorted_order]
         seen_source, seen_target = set(), set()
         kept = []
@@ -537,18 +601,19 @@ class CorrespondenceMemory:
             tid = int(self.tgt_indices[cid])
             if sid in seen_source or tid in seen_target:
                 continue
-            seen_source.add(sid); seen_target.add(tid)
+            seen_source.add(sid)
+            seen_target.add(tid)
             kept.append(cid)
         return torch.tensor(kept, dtype=torch.long, device=self.device)
 
     def _mutual_nearest(self, src_points_transformed, tgt_points, radius):
-        """Check mutual nearest neighbor consistency."""
         dist = torch.cdist(src_points_transformed[None], tgt_points[None])[0]
         src_to_tgt = dist.argmin(dim=1)
         tgt_to_src = dist.argmin(dim=0)
         mutual = tgt_to_src[src_to_tgt] == torch.arange(src_points_transformed.shape[0], device=self.device)
         within_radius = dist[torch.arange(src_points_transformed.shape[0], device=self.device), src_to_tgt] < radius
-        return mutual & within_radius
+        nearest_distance = dist[torch.arange(src_points_transformed.shape[0], device=self.device), src_to_tgt]
+        return src_to_tgt, mutual & within_radius, nearest_distance
 
     def pose_guided_candidate_expansion(self, pose, src_features, tgt_features):
         """Expand candidate pool beyond Top-K using pose-guided radius search.
@@ -559,60 +624,86 @@ class CorrespondenceMemory:
         src = torch.nn.functional.normalize(self._features(src_features), dim=1)
         tgt = torch.nn.functional.normalize(self._features(tgt_features), dim=1)
         transformed = self._transform(self.src_points, pose)
-        tgt_count = int(self.tgt_points.shape[0])
         existing_keys = set(zip(self.src_indices.tolist(), self.tgt_indices.tolist()))
-        candidates = []
         radius = self.config.memory_vdce_expand_radius
+        nearest_tgt, mutual, nearest_distance = self._mutual_nearest(transformed, self.tgt_points, radius)
+        candidates = []
         desc_threshold = self.config.memory_vdce_expand_descriptor_threshold
         max_per_source = self.config.memory_vdce_expand_max_per_source
         max_total = self.config.memory_vdce_expand_max_total
-        for src_id in range(min(int(self.src_points.shape[0]), self.topk_descriptor_scores.shape[0])):
-            dist = torch.linalg.norm(self.tgt_points - transformed[src_id], dim=1)
-            nearby = torch.where(dist < radius)[0]
-            if not nearby.numel():
+        descriptor_weight = self.config.memory_vdce_expand_descriptor_weight
+        geometry_weight = self.config.memory_vdce_expand_geometry_weight
+        total_weight = descriptor_weight + geometry_weight
+        for src_id in torch.where(mutual)[0].tolist():
+            tgt_id = int(nearest_tgt[src_id])
+            key = (src_id, tgt_id)
+            if key in existing_keys:
                 continue
-            nearby = nearby[torch.argsort(dist[nearby])]
-            added = 0
-            for tgt_id in nearby.tolist():
-                if added >= max_per_source:
-                    break
-                key = (src_id, int(tgt_id))
-                if key in existing_keys:
-                    continue
-                descriptor_sim = float(src[src_id] @ tgt[int(tgt_id)])
-                if descriptor_sim < desc_threshold:
-                    continue
-                spatial_score = float(torch.exp(-dist[int(tgt_id)] ** 2 / (2.0 * radius ** 2)))
-                candidates.append((src_id, int(tgt_id), descriptor_sim, spatial_score))
-                added += 1
-                if len(candidates) >= max_total:
-                    break
-            if len(candidates) >= max_total:
-                break
+            descriptor_sim = float(src[src_id] @ tgt[tgt_id])
+            if descriptor_sim < desc_threshold:
+                continue
+            spatial_score = float(torch.exp(-nearest_distance[src_id] ** 2 / (2.0 * radius ** 2)))
+            joint_score = (descriptor_weight * descriptor_sim + geometry_weight * spatial_score) / total_weight
+            candidates.append((src_id, tgt_id, joint_score))
         if not candidates:
             return torch.empty(0, dtype=torch.long, device=self.device), torch.empty(0, dtype=torch.long, device=self.device), torch.empty(0, dtype=self.dtype, device=self.device)
-        new_src = torch.tensor([c[0] for c in candidates], dtype=torch.long, device=self.device)
-        new_tgt = torch.tensor([c[1] for c in candidates], dtype=torch.long, device=self.device)
-        new_scores = torch.tensor([c[2] * 0.5 + c[3] * 0.5 for c in candidates], dtype=self.dtype, device=self.device)
+        candidates.sort(key=lambda item: (-item[2], item[0], item[1]))
+        selected, deferred, per_source = [], [], {}
+        quota = self.config.memory_vdce_expand_voxel_quota
+        voxel_counts = {}
+        for candidate in candidates:
+            src_id = candidate[0]
+            if per_source.get(src_id, 0) >= max_per_source:
+                continue
+            voxel = tuple(torch.floor(self.src_points[src_id] / self.config.memory_coverage_voxel_size).long().tolist())
+            if voxel_counts.get(voxel, 0) < quota:
+                selected.append(candidate)
+                per_source[src_id] = per_source.get(src_id, 0) + 1
+                voxel_counts[voxel] = voxel_counts.get(voxel, 0) + 1
+            else:
+                deferred.append(candidate)
+            if len(selected) >= max_total:
+                break
+        if len(selected) < max_total:
+            for candidate in deferred:
+                src_id = candidate[0]
+                if per_source.get(src_id, 0) >= max_per_source:
+                    continue
+                selected.append(candidate)
+                per_source[src_id] = per_source.get(src_id, 0) + 1
+                if len(selected) >= max_total:
+                    break
+        new_src = torch.tensor([c[0] for c in selected], dtype=torch.long, device=self.device)
+        new_tgt = torch.tensor([c[1] for c in selected], dtype=torch.long, device=self.device)
+        new_scores = torch.tensor([c[2] for c in selected], dtype=self.dtype, device=self.device)
         return new_src, new_tgt, new_scores
 
     def add_candidates(self, new_src, new_tgt, new_scores):
         """Add new candidates to the pool and rebuild indices."""
         if new_src.numel() == 0:
             return 0
+        existing_keys = set(zip(self.src_indices.tolist(), self.tgt_indices.tolist()))
+        kept = []
+        for src_id, tgt_id, score in zip(new_src.tolist(), new_tgt.tolist(), new_scores.tolist()):
+            key = (int(src_id), int(tgt_id))
+            if key not in existing_keys:
+                existing_keys.add(key)
+                kept.append((key[0], key[1], float(score)))
+        if not kept:
+            return 0
+        new_src = torch.tensor([item[0] for item in kept], dtype=torch.long, device=self.device)
+        new_tgt = torch.tensor([item[1] for item in kept], dtype=torch.long, device=self.device)
+        new_scores = torch.tensor([item[2] for item in kept], dtype=self.dtype, device=self.device)
         self.src_indices = torch.cat([self.src_indices, new_src])
         self.tgt_indices = torch.cat([self.tgt_indices, new_tgt])
         self.descriptor_score = torch.cat([self.descriptor_score, new_scores])
         self.alpha = torch.cat([self.alpha, self.config.memory_alpha0 + self.config.memory_descriptor_prior * new_scores])
         self.beta = torch.cat([self.beta, torch.full_like(new_scores, float(self.config.memory_beta0))])
-        old_count = self.count
         self.count = int(self.src_indices.numel())
-        for candidate_id, (src_id, tgt_id) in enumerate(zip(new_src.tolist(), new_tgt.tolist()), start=old_count):
-            self._src_to_candidate_ids.setdefault(src_id, []).append(candidate_id)
-            self._tgt_to_candidate_ids.setdefault(tgt_id, []).append(candidate_id)
-        self.edge_rows, self.edge_cols, self.static_geometry, self.row_ptr = self._build_relation_graph()
-        self.edge_success = torch.zeros_like(self.static_geometry)
-        self.edge_failure = torch.zeros_like(self.static_geometry)
+        self._src_to_candidate_ids = self._build_candidate_index(self.src_indices)
+        self._tgt_to_candidate_ids = self._build_candidate_index(self.tgt_indices)
+        self._pair_to_candidate_id = self._build_pair_index(self.src_indices, self.tgt_indices)
+        self._rebuild_relation_graph_preserving_history()
         return int(new_src.numel())
 
     def _transform(self, points, pose):

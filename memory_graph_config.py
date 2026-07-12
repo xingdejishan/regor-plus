@@ -84,8 +84,10 @@ class MemoryGraphConfig:
     memory_vdce_w_e: float = 0.20
     memory_vdce_w_c: float = 0.15
     memory_vdce_w_b: float = 0.10
-    memory_vdce_w_f: float = 0.10
+    memory_vdce_w_f: float = 0.0
     memory_vdce_normalize_residual_scale: float = 0.10
+    memory_vdce_validation_chunk_size: int = 1024
+    memory_vdce_max_evidence_candidates: int = 1024
     # VDCE memory update gating
     memory_vdce_min_score_margin: float = 0.01
     memory_vdce_min_inlier_ratio: float = 0.05
@@ -97,6 +99,9 @@ class MemoryGraphConfig:
     memory_vdce_expand_max_per_source: int = 3
     memory_vdce_expand_max_total: int = 64
     memory_vdce_expand_descriptor_threshold: float = 0.30
+    memory_vdce_expand_descriptor_weight: float = 0.50
+    memory_vdce_expand_geometry_weight: float = 0.50
+    memory_vdce_expand_voxel_quota: int = 1
 
     @classmethod
     def from_mapping(cls, values):
@@ -163,6 +168,10 @@ class MemoryGraphConfig:
             raise ValueError("memory VDCE validation weights must be non-negative.")
         if self.memory_vdce_normalize_residual_scale <= 0:
             raise ValueError("memory VDCE residual normalization scale must be positive.")
+        if self.memory_vdce_validation_chunk_size < 1:
+            raise ValueError("memory VDCE validation chunk size must be positive.")
+        if self.memory_vdce_max_evidence_candidates < 1:
+            raise ValueError("memory VDCE evidence candidate cap must be positive.")
         if self.memory_vdce_min_score_margin < 0:
             raise ValueError("memory VDCE min score margin must be non-negative.")
         if not 0 <= self.memory_vdce_min_inlier_ratio <= 1:
@@ -179,8 +188,14 @@ class MemoryGraphConfig:
             raise ValueError("memory VDCE expand max per source must be at least 1.")
         if self.memory_vdce_expand_max_total < 1:
             raise ValueError("memory VDCE expand max total must be at least 1.")
-        if not 0 < self.memory_vdce_expand_descriptor_threshold <= 1:
-            raise ValueError("memory VDCE expand descriptor threshold must be in (0, 1].")
+        if not 0 <= self.memory_vdce_expand_descriptor_threshold <= 1:
+            raise ValueError("memory VDCE descriptor threshold must be in [0, 1].")
+        if min(self.memory_vdce_expand_descriptor_weight, self.memory_vdce_expand_geometry_weight) < 0:
+            raise ValueError("memory VDCE expansion score weights must be non-negative.")
+        if self.memory_vdce_expand_descriptor_weight + self.memory_vdce_expand_geometry_weight <= 0:
+            raise ValueError("memory VDCE expansion score weights must have positive total.")
+        if self.memory_vdce_expand_voxel_quota < 1:
+            raise ValueError("memory VDCE expansion voxel quota must be positive.")
         return self
 
     def report(self):
