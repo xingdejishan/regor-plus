@@ -76,6 +76,8 @@ class MemoryHypothesis:
 class MemorySearchResult:
     pose: torch.Tensor
     best: MemoryHypothesis | None
+    best_scored: MemoryHypothesis | None
+    trusted_best: MemoryHypothesis | None
     r1_hypothesis: MemoryHypothesis | None
     r1_initialization: dict
     raw_hypotheses: list
@@ -485,14 +487,19 @@ class MemoryGuidedRegistration:
                 bool(r1_initialization["r1_memory_accepted"]),
                 "" if r1_initialization["r1_memory_accepted"] else "memory_update_gate",
             ))
-        best = self._select_best(post_refinement_hypotheses)
+        best_scored = self._select_best(post_refinement_hypotheses)
+        trusted_best = r1_hypothesis if r1_initialization["r1_memory_accepted"] else None
         if r1_hypothesis is not None:
             round_logs.append({
                 "round_id": 0,
-                "best_hypothesis_id": r1_hypothesis.hypothesis_id,
-                "best_score": r1_hypothesis.score,
-                "best_validation_score": r1_hypothesis.validation_score,
-                "best_search_score": r1_hypothesis.search_score,
+                "best_hypothesis_id": trusted_best.hypothesis_id if trusted_best is not None else None,
+                "best_score": trusted_best.score if trusted_best is not None else None,
+                "best_validation_score": trusted_best.validation_score if trusted_best is not None else None,
+                "best_search_score": trusted_best.search_score if trusted_best is not None else None,
+                "scored_hypothesis_id": best_scored.hypothesis_id,
+                "scored_validation_score": best_scored.validation_score,
+                "trusted_best_hypothesis_id": trusted_best.hypothesis_id if trusted_best is not None else None,
+                "trusted_best_validation_score": trusted_best.validation_score if trusted_best is not None else None,
                 "round_hypothesis_id": r1_hypothesis.hypothesis_id,
                 "round_score": r1_hypothesis.score,
                 "round_validation_score": r1_hypothesis.validation_score,
@@ -525,7 +532,7 @@ class MemoryGuidedRegistration:
         stale = 0
         for round_id in range(1, self.config.memory_max_rounds + 1):
             round_started = time.perf_counter()
-            best_before_round = best
+            trusted_before_round = trusted_best
             ranked = torch.argsort(memory.rank(), descending=True)
             current_round, novel = [], 0
             sampling_attempts, raw_generated = 0, 0
@@ -639,13 +646,18 @@ class MemoryGuidedRegistration:
                     candidate_logs.append(child_log)
             if not current_round:
                 stale += 1
+                scored_reference = best_scored
                 round_logs.append({
                     "round_id": round_id,
-                    "best_hypothesis_id": best.hypothesis_id,
-                    "best_score": best.score,
-                    "best_validation_score": best.validation_score,
-                    "best_search_score": best.search_score,
-                    "round_hypothesis_id": best.hypothesis_id,
+                    "best_hypothesis_id": trusted_best.hypothesis_id if trusted_best is not None else None,
+                    "best_score": trusted_best.score if trusted_best is not None else None,
+                    "best_validation_score": trusted_best.validation_score if trusted_best is not None else None,
+                    "best_search_score": trusted_best.search_score if trusted_best is not None else None,
+                    "scored_hypothesis_id": scored_reference.hypothesis_id if scored_reference is not None else None,
+                    "scored_validation_score": scored_reference.validation_score if scored_reference is not None else None,
+                    "trusted_best_hypothesis_id": trusted_best.hypothesis_id if trusted_best is not None else None,
+                    "trusted_best_validation_score": trusted_best.validation_score if trusted_best is not None else None,
+                    "round_hypothesis_id": scored_reference.hypothesis_id if scored_reference is not None else None,
                     "round_score": float("-inf"),
                     "round_validation_score": float("-inf"),
                     "round_search_score": float("-inf"),
@@ -657,18 +669,20 @@ class MemoryGuidedRegistration:
                     "sampling_attempt_count": sampling_attempts,
                     "sampling_attempts": sampling_attempts,
                     "sampling_budget_exhausted": 1,
-                    "inlier_count": best.inlier_count,
-                    "unique_inlier_ratio": best.unique_inlier_ratio,
-                    "median_residual": best.median_residual,
-                    "bidirectional_consistency": best.bidirectional_consistency,
-                    "free_space_conflict_ratio": best.free_space_conflict_ratio,
-                    "free_space_available": int(best.free_space_available),
-                    "coverage": best.coverage,
-                    "best_coverage": best.coverage,
+                    "inlier_count": trusted_best.inlier_count if trusted_best is not None else 0,
+                    "unique_inlier_ratio": trusted_best.unique_inlier_ratio if trusted_best is not None else 0.0,
+                    "median_residual": trusted_best.median_residual if trusted_best is not None else float("inf"),
+                    "bidirectional_consistency": trusted_best.bidirectional_consistency if trusted_best is not None else 0.0,
+                    "free_space_conflict_ratio": trusted_best.free_space_conflict_ratio if trusted_best is not None else 0.0,
+                    "free_space_available": int(trusted_best.free_space_available) if trusted_best is not None else 0,
+                    "coverage": trusted_best.coverage if trusted_best is not None else 0.0,
+                    "best_coverage": trusted_best.coverage if trusted_best is not None else 0.0,
                     "duplicate_basin_rate": None,
                     "novelty": None,
                     "posterior_delta": 0.0,
                     "graph_delta": 0.0,
+                    "memory_accepted": 0,
+                    "candidate_expansion_count": 0,
                     "basin_count": len(memory.basins),
                     "stale_rounds": stale,
                     "round_runtime_seconds": time.perf_counter() - round_started,
@@ -678,22 +692,36 @@ class MemoryGuidedRegistration:
                     break
                 continue
             current = self._select_best(current_round)
-            memory_accepted = self._memory_update_gate(current, best_before_round)
+            if best_scored is None or current.validation_score > best_scored.validation_score:
+                best_scored = current
+            trusted_candidates = [
+                hypothesis
+                for hypothesis in current_round
+                if self._memory_update_gate(hypothesis, trusted_before_round)
+            ]
+            trusted_current = self._select_best(trusted_candidates)
+            memory_accepted = trusted_current is not None
             posterior_delta, graph_delta = 0.0, 0.0
             expansion_count = 0
             if memory_accepted:
-                best, stale = current, 0
+                trusted_best, stale = trusted_current, 0
                 posterior_delta = memory.update_pair_posterior(
-                    current.inlier_ids,
-                    current.verified_candidate_outliers,
+                    trusted_current.inlier_ids,
+                    trusted_current.verified_candidate_outliers,
                 )
                 graph_delta = memory.update_relation_graph(
-                    current.inlier_ids,
-                    current.verified_candidate_outliers,
+                    trusted_current.inlier_ids,
+                    trusted_current.verified_candidate_outliers,
                 )
-                memory.update_basin(current.pose, current.support_signature, current.validation_score, improved=True, support_ids=current.support_ids)
+                memory.update_basin(
+                    trusted_current.pose,
+                    trusted_current.support_signature,
+                    trusted_current.validation_score,
+                    improved=True,
+                    support_ids=trusted_current.support_ids,
+                )
                 new_src, new_tgt, new_scores = memory.pose_guided_candidate_expansion(
-                    current.pose, src_features, tgt_features,
+                    trusted_current.pose, src_features, tgt_features,
                 )
                 expansion_count = memory.add_candidates(new_src, new_tgt, new_scores)
             else:
@@ -701,16 +729,24 @@ class MemoryGuidedRegistration:
                 memory.update_basin(current.pose, current.support_signature, current.validation_score, improved=False, support_ids=current.support_ids)
             memory.compress()
             current_coverage = current.coverage
-            best_coverage = best.coverage
-            rotation_delta, translation_delta = self._pose_distance(best.pose, best_before_round.pose) if best_before_round is not None else (float("inf"), float("inf"))
-            score_delta = float("inf") if best_before_round is None else abs(best.validation_score - best_before_round.validation_score) / max(abs(best_before_round.validation_score), 1e-8)
+            best_coverage = trusted_best.coverage if trusted_best is not None else 0.0
+            if trusted_before_round is not None and trusted_best is not None:
+                rotation_delta, translation_delta = self._pose_distance(trusted_best.pose, trusted_before_round.pose)
+                score_delta = abs(trusted_best.validation_score - trusted_before_round.validation_score) / max(abs(trusted_before_round.validation_score), 1e-8)
+            else:
+                rotation_delta, translation_delta, score_delta = float("inf"), float("inf"), float("inf")
             novelty = novel / max(1, sum(item.stage == "raw" for item in current_round)) if self.config.memory_use_basin else None
             round_logs.append({
                 "round_id": round_id,
-                "best_hypothesis_id": best.hypothesis_id,
-                "best_score": best.score,
-                "best_validation_score": best.validation_score,
-                "best_search_score": best.search_score,
+                "best_hypothesis_id": trusted_best.hypothesis_id if trusted_best is not None else None,
+                "best_score": trusted_best.score if trusted_best is not None else None,
+                "best_validation_score": trusted_best.validation_score if trusted_best is not None else None,
+                "best_search_score": trusted_best.search_score if trusted_best is not None else None,
+                "scored_hypothesis_id": best_scored.hypothesis_id if best_scored is not None else None,
+                "scored_validation_score": best_scored.validation_score if best_scored is not None else None,
+                "trusted_round_hypothesis_id": trusted_current.hypothesis_id if trusted_current is not None else None,
+                "trusted_best_hypothesis_id": trusted_best.hypothesis_id if trusted_best is not None else None,
+                "trusted_best_validation_score": trusted_best.validation_score if trusted_best is not None else None,
                 "round_hypothesis_id": current.hypothesis_id,
                 "round_score": current.score,
                 "round_validation_score": current.validation_score,
@@ -742,9 +778,11 @@ class MemoryGuidedRegistration:
                 "round_runtime_seconds": time.perf_counter() - round_started,
                 **rejection_counts,
             })
-            if not self.config.memory_fixed_budget_mode and self._strong_stop(best, memory.src_points.shape[0]):
+            if not self.config.memory_fixed_budget_mode and trusted_best is not None and self._strong_stop(trusted_best, memory.src_points.shape[0]):
                 break
             converged = (
+                trusted_best is not None
+                and
                 stale >= self.config.memory_patience
                 and score_delta < self.config.memory_score_epsilon
                 and rotation_delta < self.config.memory_pose_epsilon_rotation_deg
@@ -755,7 +793,37 @@ class MemoryGuidedRegistration:
                 converged = converged and novelty < self.config.memory_novelty_threshold
             if not self.config.memory_fixed_budget_mode and converged:
                 break
-        if best is None:
+        if trusted_best is None:
             identity = torch.eye(4, dtype=memory.dtype, device=memory.device)[None]
-            return MemorySearchResult(identity, None, r1_hypothesis, r1_initialization, raw_hypotheses, post_refinement_hypotheses, evaluated_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)
-        return MemorySearchResult(best.pose, best, r1_hypothesis, r1_initialization, raw_hypotheses, post_refinement_hypotheses, evaluated_hypotheses, round_logs, candidate_logs, memory.summary(), memory.src_indices, memory.tgt_indices)
+            return MemorySearchResult(
+                pose=identity,
+                best=None,
+                best_scored=best_scored,
+                trusted_best=None,
+                r1_hypothesis=r1_hypothesis,
+                r1_initialization=r1_initialization,
+                raw_hypotheses=raw_hypotheses,
+                post_refinement_hypotheses=post_refinement_hypotheses,
+                evaluated_hypotheses=evaluated_hypotheses,
+                round_logs=round_logs,
+                candidate_logs=candidate_logs,
+                memory_summary=memory.summary(),
+                candidate_src_indices=memory.src_indices,
+                candidate_tgt_indices=memory.tgt_indices,
+            )
+        return MemorySearchResult(
+            pose=trusted_best.pose,
+            best=trusted_best,
+            best_scored=best_scored,
+            trusted_best=trusted_best,
+            r1_hypothesis=r1_hypothesis,
+            r1_initialization=r1_initialization,
+            raw_hypotheses=raw_hypotheses,
+            post_refinement_hypotheses=post_refinement_hypotheses,
+            evaluated_hypotheses=evaluated_hypotheses,
+            round_logs=round_logs,
+            candidate_logs=candidate_logs,
+            memory_summary=memory.summary(),
+            candidate_src_indices=memory.src_indices,
+            candidate_tgt_indices=memory.tgt_indices,
+        )

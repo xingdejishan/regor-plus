@@ -559,6 +559,7 @@ def run_memory_graph_experiment(config, memory_config):
                 }
             else:
                 selected = audit_hypothesis(result.best, pair.gt_transform, config.re_thre, config.te_thre)
+            selected_scored = audit_hypothesis(result.best_scored, pair.gt_transform, config.re_thre, config.te_thre) if result.best_scored is not None else None
             fmr_ratio, fmr, fmr_inlier_count = memory_candidate_fmr(pair, result, float(config.inlier_threshold))
             first_raw_success_round = next((item.round_id for item, audit in zip(result.raw_hypotheses, raw_audits) if audit["raw_success"]), -1)
             first_post_refinement_success_round = next((item.round_id for item, audit in zip(result.post_refinement_hypotheses, post_refinement_audits) if audit["local_refined_success"]), -1)
@@ -571,6 +572,15 @@ def run_memory_graph_experiment(config, memory_config):
                 "selected_success": selected["local_refined_success"],
                 "selected_re": selected["local_refined_re"],
                 "selected_te": selected["local_refined_te"],
+                "selected_scored_hypothesis_id": result.best_scored.hypothesis_id if result.best_scored is not None else None,
+                "selected_scored_validation_score": result.best_scored.validation_score if result.best_scored is not None else None,
+                "selected_scored_pose": result.best_scored.pose[0].detach().cpu().tolist() if result.best_scored is not None else None,
+                "selected_scored_success": selected_scored["local_refined_success"] if selected_scored is not None else 0,
+                "selected_scored_re": selected_scored["local_refined_re"] if selected_scored is not None else None,
+                "selected_scored_te": selected_scored["local_refined_te"] if selected_scored is not None else None,
+                "selected_trusted_hypothesis_id": result.trusted_best.hypothesis_id if result.trusted_best is not None else None,
+                "selected_trusted_validation_score": result.trusted_best.validation_score if result.trusted_best is not None else None,
+                "selected_trusted_pose": result.trusted_best.pose[0].detach().cpu().tolist() if result.trusted_best is not None else None,
                 "first_raw_success_round": first_raw_success_round,
                 "first_post_refinement_success_round": first_post_refinement_success_round,
                 "raw_hypothesis_count": len(result.raw_hypotheses),

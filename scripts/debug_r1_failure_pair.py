@@ -220,14 +220,26 @@ def main():
                 "r1_te": te,
                 **row,
             })
-        selected_audit = audit_hypothesis(result.best, pair.gt_transform, config.re_thre, config.te_thre)
+        if result.best is None:
+            selected_re, selected_te = pose_errors(result.pose, pair.gt_transform)
+            selected_audit = {
+                "local_refined_success": int(selected_re < config.re_thre and selected_te < config.te_thre),
+                "local_refined_re": selected_re,
+                "local_refined_te": selected_te,
+            }
+        else:
+            selected_audit = audit_hypothesis(result.best, pair.gt_transform, config.re_thre, config.te_thre)
         selected_summaries.append({
             "variant": name,
             "pair_id": pair.pair_id,
             "summary_type": "selected",
-            "selected_hypothesis_id": result.best.hypothesis_id,
-            "selected_validation_score": result.best.validation_score,
-            "selected_search_score": result.best.search_score,
+            "selected_hypothesis_id": result.best.hypothesis_id if result.best is not None else None,
+            "selected_validation_score": result.best.validation_score if result.best is not None else None,
+            "selected_search_score": result.best.search_score if result.best is not None else None,
+            "selected_scored_hypothesis_id": result.best_scored.hypothesis_id if result.best_scored is not None else None,
+            "selected_scored_validation_score": result.best_scored.validation_score if result.best_scored is not None else None,
+            "selected_trusted_hypothesis_id": result.trusted_best.hypothesis_id if result.trusted_best is not None else None,
+            "selected_trusted_validation_score": result.trusted_best.validation_score if result.trusted_best is not None else None,
             "selected_success": selected_audit["local_refined_success"],
             "selected_re": selected_audit["local_refined_re"],
             "selected_te": selected_audit["local_refined_te"],

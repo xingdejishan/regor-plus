@@ -388,6 +388,88 @@ class CorrespondenceMemoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MemoryGuidedRegistration(config()).run(source, target, source_features, target_features)
 
+    def test_selected_pose_uses_trusted_best_when_r1_has_higher_rejected_score(self):
+        class ControlledScores(MemoryGuidedRegistration):
+            def _make_hypothesis(self, *args, **kwargs):
+                hypothesis = super()._make_hypothesis(*args, **kwargs)
+                if hypothesis.stage == "r1":
+                    hypothesis.validation_score = 0.60
+                    hypothesis.unique_inlier_ratio = 0.40
+                    hypothesis.coverage = 0.40
+                    hypothesis.median_residual = 0.90
+                elif hypothesis.stage == "raw":
+                    hypothesis.validation_score = 0.58
+                    hypothesis.unique_inlier_ratio = 0.40
+                    hypothesis.coverage = 0.40
+                    hypothesis.median_residual = 0.01
+                else:
+                    hypothesis.validation_score = 0.57
+                    hypothesis.unique_inlier_ratio = 0.40
+                    hypothesis.coverage = 0.40
+                    hypothesis.median_residual = 0.01
+                return hypothesis
+
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        r1_pose = torch.eye(4)[None]
+        r1_pose[0, :3, :3], r1_pose[0, :3, 3] = rotation, translation
+        result = ControlledScores(config(
+            memory_max_rounds=1,
+            memory_hypotheses_per_round=1,
+            memory_max_sampling_attempts=4,
+            memory_tau_linear=0.0,
+            memory_tau_planar=0.0,
+            memory_min_coverage=0.0,
+            memory_min_cross_group_agreement=0.0,
+        )).run(source, target, source_features, target_features, initial_pose=r1_pose)
+        self.assertEqual(result.r1_initialization["r1_memory_accepted"], 0)
+        self.assertEqual(result.best_scored.hypothesis_id, result.r1_hypothesis.hypothesis_id)
+        self.assertIsNotNone(result.trusted_best)
+        self.assertEqual(result.best.hypothesis_id, result.trusted_best.hypothesis_id)
+        self.assertNotEqual(result.best.hypothesis_id, result.r1_hypothesis.hypothesis_id)
+        self.assertLess(result.best.validation_score, result.best_scored.validation_score)
+        self.assertEqual(result.round_logs[-1]["scored_hypothesis_id"], result.r1_hypothesis.hypothesis_id)
+        self.assertEqual(result.round_logs[-1]["trusted_best_hypothesis_id"], result.best.hypothesis_id)
+
+    def test_lower_scored_candidate_can_become_trusted_when_round_winner_fails_gate(self):
+        class ControlledScores(MemoryGuidedRegistration):
+            def _make_hypothesis(self, *args, **kwargs):
+                hypothesis = super()._make_hypothesis(*args, **kwargs)
+                hypothesis.unique_inlier_ratio = 0.40
+                hypothesis.coverage = 0.40
+                if hypothesis.stage == "r1":
+                    hypothesis.validation_score = 0.60
+                    hypothesis.median_residual = 0.90
+                elif hypothesis.stage == "raw" and hypothesis.hypothesis_id == 1:
+                    hypothesis.validation_score = 0.65
+                    hypothesis.median_residual = 0.90
+                elif hypothesis.stage == "raw":
+                    hypothesis.validation_score = 0.58
+                    hypothesis.median_residual = 0.01
+                else:
+                    hypothesis.validation_score = 0.57
+                    hypothesis.median_residual = 0.01
+                return hypothesis
+
+        source, target, source_features, target_features, rotation, translation = synthetic_pair()
+        r1_pose = torch.eye(4)[None]
+        r1_pose[0, :3, :3], r1_pose[0, :3, 3] = rotation, translation
+        result = ControlledScores(config(
+            memory_max_rounds=1,
+            memory_hypotheses_per_round=2,
+            memory_max_sampling_attempts=8,
+            memory_tau_linear=0.0,
+            memory_tau_planar=0.0,
+            memory_min_coverage=0.0,
+            memory_min_cross_group_agreement=0.0,
+        )).run(source, target, source_features, target_features, initial_pose=r1_pose)
+        raw = [hypothesis for hypothesis in result.raw_hypotheses if hypothesis.stage == "raw"]
+        rejected_round_winner = next(hypothesis for hypothesis in raw if hypothesis.validation_score == 0.65)
+        accepted_lower_score = next(hypothesis for hypothesis in raw if hypothesis.validation_score == 0.58)
+        self.assertEqual(result.best_scored.hypothesis_id, rejected_round_winner.hypothesis_id)
+        self.assertEqual(result.trusted_best.hypothesis_id, accepted_lower_score.hypothesis_id)
+        self.assertEqual(result.round_logs[-1]["round_hypothesis_id"], rejected_round_winner.hypothesis_id)
+        self.assertEqual(result.round_logs[-1]["trusted_round_hypothesis_id"], accepted_lower_score.hypothesis_id)
+
     def test_raw_parent_survives_rejected_refinement_child(self):
         class RejectingRefiner(MemoryGuidedRegistration):
             def _robust_refine(self, memory, pose):
