@@ -1,0 +1,16 @@
+{
+  "pair_count": 49,
+  "trace_count": 49,
+  "error_count": 0,
+  "variants": [
+    "singleton",
+    "immediate",
+    "no_commuting",
+    "no_coalescence",
+    "no_point_regor",
+    "full"
+  ],
+  "gt_loaded": false,
+  "evaluator_started": false,
+  "online_rows_sha256": "7f2fe1c30a738a535ea4e7c4a930dac57df7d464ebbe1a422f925222ea40dc93"
+}

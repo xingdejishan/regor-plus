@@ -1,0 +1,305 @@
+{
+  "scope": {
+    "start": 1420,
+    "limit": 49,
+    "count": 49
+  },
+  "integrity": {
+    "online_complete_sha256": "2e290680fc4f8f24a2efb0d9e97d8049ca91938942e5ac208031b1907970c69c",
+    "online_rows_sha256": "7f2fe1c30a738a535ea4e7c4a930dac57df7d464ebbe1a422f925222ea40dc93",
+    "all_trace_hashes_match": true,
+    "evaluator_process_separate": true
+  },
+  "official": {
+    "baseline": {
+      "success": 35,
+      "total": 49,
+      "rr": 0.7142857142857143,
+      "rre_mean_deg": 38.72867411299917,
+      "rte_mean_cm": 88.85102977603071
+    },
+    "singleton": {
+      "success": 17,
+      "total": 49,
+      "rr": 0.3469387755102041,
+      "rre_mean_deg": 74.17278161953756,
+      "rte_mean_cm": 144.23429806598534
+    },
+    "immediate": {
+      "success": 14,
+      "total": 49,
+      "rr": 0.2857142857142857,
+      "rre_mean_deg": 83.14542121453924,
+      "rte_mean_cm": 165.44384700472156
+    },
+    "no_commuting": {
+      "success": 14,
+      "total": 49,
+      "rr": 0.2857142857142857,
+      "rre_mean_deg": 82.48900020004805,
+      "rte_mean_cm": 157.934556495596
+    },
+    "no_coalescence": {
+      "success": 15,
+      "total": 49,
+      "rr": 0.30612244897959184,
+      "rre_mean_deg": 84.66835088431485,
+      "rte_mean_cm": 159.8653561755266
+    },
+    "no_point_regor": {
+      "success": 14,
+      "total": 49,
+      "rr": 0.2857142857142857,
+      "rre_mean_deg": 80.46236396532612,
+      "rte_mean_cm": 131.48898017160306
+    },
+    "full": {
+      "success": 15,
+      "total": 49,
+      "rr": 0.30612244897959184,
+      "rre_mean_deg": 79.18867777668142,
+      "rte_mean_cm": 143.35474533940769
+    }
+  },
+  "paired_vs_baseline": {
+    "singleton": {
+      "rescue": 2,
+      "damage": 20,
+      "net": -18,
+      "exact_two_sided_p": 0.00012111663818359375,
+      "paired_bootstrap_95_ci_rr_difference": [
+        -0.5306122448979592,
+        -0.20408163265306123
+      ]
+    },
+    "immediate": {
+      "rescue": 2,
+      "damage": 23,
+      "net": -21,
+      "exact_two_sided_p": 1.9431114196777344e-05,
+      "paired_bootstrap_95_ci_rr_difference": [
+        -0.5918367346938775,
+        -0.2653061224489796
+      ]
+    },
+    "no_commuting": {
+      "rescue": 2,
+      "damage": 23,
+      "net": -21,
+      "exact_two_sided_p": 1.9431114196777344e-05,
+      "paired_bootstrap_95_ci_rr_difference": [
+        -0.5918367346938775,
+        -0.2653061224489796
+      ]
+    },
+    "no_coalescence": {
+      "rescue": 2,
+      "damage": 22,
+      "net": -20,
+      "exact_two_sided_p": 3.5881996154785156e-05,
+      "paired_bootstrap_95_ci_rr_difference": [
+        -0.5714285714285714,
+        -0.24489795918367346
+      ]
+    },
+    "no_point_regor": {
+      "rescue": 2,
+      "damage": 23,
+      "net": -21,
+      "exact_two_sided_p": 1.9431114196777344e-05,
+      "paired_bootstrap_95_ci_rr_difference": [
+        -0.5918367346938775,
+        -0.2653061224489796
+      ]
+    },
+    "full": {
+      "rescue": 2,
+      "damage": 22,
+      "net": -20,
+      "exact_two_sided_p": 3.5881996154785156e-05,
+      "paired_bootstrap_95_ci_rr_difference": [
+        -0.5714285714285714,
+        -0.24489795918367346
+      ]
+    }
+  },
+  "by_scene": {
+    "sun3d-hotel_umd-maryland_hotel3": {
+      "baseline": {
+        "success": 35,
+        "total": 49,
+        "rr": 0.7142857142857143
+      },
+      "singleton": {
+        "success": 17,
+        "total": 49,
+        "rr": 0.3469387755102041
+      },
+      "immediate": {
+        "success": 14,
+        "total": 49,
+        "rr": 0.2857142857142857
+      },
+      "no_commuting": {
+        "success": 14,
+        "total": 49,
+        "rr": 0.2857142857142857
+      },
+      "no_coalescence": {
+        "success": 15,
+        "total": 49,
+        "rr": 0.30612244897959184
+      },
+      "no_point_regor": {
+        "success": 14,
+        "total": 49,
+        "rr": 0.2857142857142857
+      },
+      "full": {
+        "success": 15,
+        "total": 49,
+        "rr": 0.30612244897959184
+      }
+    }
+  },
+  "telemetry": {
+    "singleton": {
+      "resolution": 0.031702008136377045,
+      "source_orbit_count": 192.0,
+      "target_orbit_count": 192.0,
+      "source_non_singleton_orbits": 0.0,
+      "target_non_singleton_orbits": 0.0,
+      "lift_atom_count": 192.0,
+      "pose_birth_count": 50.0,
+      "domain_count_before": 9.489795918367347,
+      "domain_count_after": 9.428571428571429,
+      "birth_domain_count": 5.081632653061225,
+      "regenerated_atom_count": 4.346938775510204,
+      "orbit_regeneration_rounds": 2.204081632653061,
+      "non_singleton_orbits": 0.0,
+      "relation_rank": 3.0,
+      "unique_lifts": 9.428571428571429,
+      "region_coverage": 17.387755102040817,
+      "mean_residual": 0.055654999476914505,
+      "coalesced_count": 1.0,
+      "materialized_pair_count": 8.693877551020408,
+      "regor_rounds": 2.0,
+      "final_correspondence_count": 45.142857142857146
+    },
+    "immediate": {
+      "resolution": 0.031702008136377045,
+      "source_orbit_count": 225.6122448979592,
+      "target_orbit_count": 226.3877551020408,
+      "source_non_singleton_orbits": 33.61224489795919,
+      "target_non_singleton_orbits": 34.38775510204081,
+      "lift_atom_count": 192.0,
+      "pose_birth_count": 50.0,
+      "domain_count_before": 9.938775510204081,
+      "domain_count_after": 9.714285714285714,
+      "birth_domain_count": 4.510204081632653,
+      "regenerated_atom_count": 0.0,
+      "orbit_regeneration_rounds": 0.0,
+      "non_singleton_orbits": 9.244897959183673,
+      "relation_rank": 2.9591836734693877,
+      "unique_lifts": 9.714285714285714,
+      "region_coverage": 17.877551020408163,
+      "mean_residual": 0.06325625422961857,
+      "coalesced_count": 1.0,
+      "materialized_pair_count": 8.938775510204081,
+      "regor_rounds": 2.0,
+      "final_correspondence_count": 44.0
+    },
+    "no_commuting": {
+      "resolution": 0.031702008136377045,
+      "source_orbit_count": 225.6122448979592,
+      "target_orbit_count": 226.3877551020408,
+      "source_non_singleton_orbits": 33.61224489795919,
+      "target_non_singleton_orbits": 34.38775510204081,
+      "lift_atom_count": 192.0,
+      "pose_birth_count": 50.0,
+      "domain_count_before": 9.857142857142858,
+      "domain_count_after": 9.857142857142858,
+      "birth_domain_count": 4.428571428571429,
+      "regenerated_atom_count": 0.0,
+      "orbit_regeneration_rounds": 0.0,
+      "non_singleton_orbits": 9.224489795918368,
+      "relation_rank": 2.9591836734693877,
+      "unique_lifts": 9.53061224489796,
+      "region_coverage": 18.163265306122447,
+      "mean_residual": 0.06394342333078384,
+      "coalesced_count": 1.0,
+      "materialized_pair_count": 9.081632653061224,
+      "regor_rounds": 2.0,
+      "final_correspondence_count": 44.95918367346939
+    },
+    "no_coalescence": {
+      "resolution": 0.031702008136377045,
+      "source_orbit_count": 225.6122448979592,
+      "target_orbit_count": 226.3877551020408,
+      "source_non_singleton_orbits": 33.61224489795919,
+      "target_non_singleton_orbits": 34.38775510204081,
+      "lift_atom_count": 192.0,
+      "pose_birth_count": 50.0,
+      "domain_count_before": 9.673469387755102,
+      "domain_count_after": 9.551020408163266,
+      "birth_domain_count": 4.3061224489795915,
+      "regenerated_atom_count": 5.244897959183674,
+      "orbit_regeneration_rounds": 2.3877551020408165,
+      "non_singleton_orbits": 8.89795918367347,
+      "relation_rank": 2.938775510204082,
+      "unique_lifts": 9.122448979591837,
+      "region_coverage": 17.306122448979593,
+      "mean_residual": 0.06469444592236256,
+      "coalesced_count": 1.0,
+      "materialized_pair_count": 8.653061224489797,
+      "regor_rounds": 2.0,
+      "final_correspondence_count": 44.714285714285715
+    },
+    "no_point_regor": {
+      "resolution": 0.031702008136377045,
+      "source_orbit_count": 225.6122448979592,
+      "target_orbit_count": 226.3877551020408,
+      "source_non_singleton_orbits": 33.61224489795919,
+      "target_non_singleton_orbits": 34.38775510204081,
+      "lift_atom_count": 192.0,
+      "pose_birth_count": 50.0,
+      "domain_count_before": 9.46938775510204,
+      "domain_count_after": 9.36734693877551,
+      "birth_domain_count": 5.061224489795919,
+      "regenerated_atom_count": 4.3061224489795915,
+      "orbit_regeneration_rounds": 2.2448979591836733,
+      "non_singleton_orbits": 8.714285714285714,
+      "relation_rank": 2.9591836734693877,
+      "unique_lifts": 9.081632653061224,
+      "region_coverage": 17.224489795918366,
+      "mean_residual": 0.0563704824569274,
+      "coalesced_count": 1.0,
+      "materialized_pair_count": 8.612244897959183,
+      "regor_rounds": 0.0,
+      "final_correspondence_count": 8.612244897959183
+    },
+    "full": {
+      "resolution": 0.031702008136377045,
+      "source_orbit_count": 225.6122448979592,
+      "target_orbit_count": 226.3877551020408,
+      "source_non_singleton_orbits": 33.61224489795919,
+      "target_non_singleton_orbits": 34.38775510204081,
+      "lift_atom_count": 192.0,
+      "pose_birth_count": 50.0,
+      "domain_count_before": 9.46938775510204,
+      "domain_count_after": 9.36734693877551,
+      "birth_domain_count": 5.061224489795919,
+      "regenerated_atom_count": 4.3061224489795915,
+      "orbit_regeneration_rounds": 2.2448979591836733,
+      "non_singleton_orbits": 8.714285714285714,
+      "relation_rank": 2.9591836734693877,
+      "unique_lifts": 9.081632653061224,
+      "region_coverage": 17.224489795918366,
+      "mean_residual": 0.0563704824569274,
+      "coalesced_count": 1.0,
+      "materialized_pair_count": 8.612244897959183,
+      "regor_rounds": 2.0,
+      "final_correspondence_count": 44.42857142857143
+    }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "status": "strict pairwise PLY-only OrbitRegor online run",
+  "input": "framed stream containing only current source/target XYZ and frozen official REGOR features",
+  "identity_signals": "pair/scene/file/dataset identity absent; stochastic state derived only from current coordinates",
+  "baseline": "official REGOR terminal pipeline",
+  "variants": [
+    "singleton",
+    "immediate",
+    "no_commuting",
+    "no_coalescence",
+    "no_point_regor",
+    "full"
+  ],
+  "config": {
+    "patch_count": 192,
+    "patch_knn": 64,
+    "scales": [
+      4.0,
+      8.0,
+      16.0
+    ],
+    "radial_bins": 4,
+    "orbit_neighbor_count": 3,
+    "orbit_signature_threshold": 2.5,
+    "orbit_min_separation": 6.0,
+    "orbit_max_size": 8,
+    "cross_descriptor_topk": 3,
+    "cross_pair_budget": 192,
+    "compatibility_tolerance_m": 0.1,
+    "clique_min_size": 3,
+    "pose_budget": 50,
+    "pose_nms_rotation_deg": 5.0,
+    "pose_nms_translation_m": 0.1,
+    "birth_lift_tolerance": 2.0,
+    "coarse_lift_tolerance": 4.0,
+    "relation_tolerance": 3.0,
+    "lift_rounds": 3,
+    "materialized_pair_budget": 128,
+    "regor_seed_minimum": 100,
+    "regor_knn": [
+      100,
+      20
+    ],
+    "regor_sampling": [
+      100,
+      500
+    ]
+  },
+  "unique_output": true,
+  "fail_closed": true,
+  "gt_loaded": false,
+  "evaluator_started": false,
+  "implementation_sha256": {
+    "code/regor/run_orbit_regor_online.py": "8a2a01c4713c8f745871f49ce7f63e870fbbae1e801d1556d70d1203a5beb068",
+    "code/regor/orbit_regor/config.py": "a04d5a45c1602aea3fdae1f355aadf26e9649518b3add75f1949a580687f4ef8",
+    "code/regor/orbit_regor/atlas.py": "b7853ce93d23eabdd7e8a4403111023e27430817c37e028d08b34ec7e55dbb9e",
+    "code/regor/orbit_regor/orbit_cover.py": "b269585533ff9d2fc8bc0815ff60b6935901bcce3625d6f284c3a0ba0ca6bcaf",
+    "code/regor/orbit_regor/solver.py": "5d5aa4d280a6367918d4d8adfbc9cc1e440dc3ce05aac2419e4dd11ba76f9c02",
+    "code/regor/orbit_regor/runtime.py": "3e492d99f8bad744a5d1177d01f94cc2541e3b7ba7db1691430878f419a35cc8",
+    "code/regor/orbit_regor/pipeline.py": "9dc896f05bc6ca108bc3dc5be3451d5a78f109373214504bac77aa51b0ef39ef",
+    "code/regor/run_probe_regor_natural1781.py": "af47c13658ab1946d81505ed1031c4be2ff971ff71935c5d42ed6b0625e46409",
+    "source/regor/initial_matching_plus.py": "d40591b2d254903ac561aba97bcf32557445e2319769a55c7910c4c5ae283f7d",
+    "source/regor/Correspondence_regenerate_v2.py": "3ce2fe30316ceee3a0222fc563cad67502631df4acd42d88c4ce611de9e961c5",
+    "source/regor/Tranformation_estimaton.py": "b930f62e0ba4dda98a02f36ae0530804ce98ff8a1304e2b9f3e5026d9a89c58d"
+  }
+}
