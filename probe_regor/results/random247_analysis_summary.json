@@ -1,0 +1,110 @@
+{
+  "protocol_review": {
+    "track": "strict pairwise",
+    "pair_count": 247,
+    "online_error_count": 0,
+    "finite_baseline_count": 247,
+    "finite_probe_count": 247,
+    "online_and_analysis_processes_separate": true
+  },
+  "threshold_metrics": {
+    "rule": "RRE < 15 degrees and RTE < 30 cm",
+    "baseline_count": 183,
+    "probe_count": 187,
+    "baseline_rate": 0.7408906882591093,
+    "probe_rate": 0.757085020242915,
+    "rescue": 6,
+    "damage": 2,
+    "net": 4,
+    "exact_mcnemar_p": 0.2890625,
+    "one_sided_mcnemar_p": 0.14453125,
+    "paired_bootstrap_difference_ci95": [
+      -0.004048582995951417,
+      0.04048582995951417
+    ],
+    "baseline_median_rre": 3.36484426687574,
+    "probe_median_rre": 3.3286139011304914,
+    "baseline_median_rte_cm": 9.631674298065992,
+    "probe_median_rte_cm": 8.839249338950877
+  },
+  "per_scene": {
+    "7-scenes-redkitchen": {
+      "pairs": 68,
+      "baseline_count": 54,
+      "probe_count": 53,
+      "baseline_rate": 0.7941176470588235,
+      "probe_rate": 0.7794117647058824,
+      "difference": -0.014705882352941124
+    },
+    "sun3d-home_at-home_at_scan1_2013_jan_1": {
+      "pairs": 39,
+      "baseline_count": 27,
+      "probe_count": 28,
+      "baseline_rate": 0.6923076923076923,
+      "probe_rate": 0.717948717948718,
+      "difference": 0.02564102564102566
+    },
+    "sun3d-home_md-home_md_scan9_2012_sep_30": {
+      "pairs": 32,
+      "baseline_count": 20,
+      "probe_count": 21,
+      "baseline_rate": 0.625,
+      "probe_rate": 0.65625,
+      "difference": 0.03125
+    },
+    "sun3d-hotel_uc-scan3": {
+      "pairs": 32,
+      "baseline_count": 29,
+      "probe_count": 30,
+      "baseline_rate": 0.90625,
+      "probe_rate": 0.9375,
+      "difference": 0.03125
+    },
+    "sun3d-hotel_umd-maryland_hotel1": {
+      "pairs": 27,
+      "baseline_count": 21,
+      "probe_count": 22,
+      "baseline_rate": 0.7777777777777778,
+      "probe_rate": 0.8148148148148148,
+      "difference": 0.03703703703703698
+    },
+    "sun3d-hotel_umd-maryland_hotel3": {
+      "pairs": 7,
+      "baseline_count": 3,
+      "probe_count": 3,
+      "baseline_rate": 0.42857142857142855,
+      "probe_rate": 0.42857142857142855,
+      "difference": 0.0
+    },
+    "sun3d-mit_76_studyroom-76-1studyroom2": {
+      "pairs": 36,
+      "baseline_count": 25,
+      "probe_count": 26,
+      "baseline_rate": 0.6944444444444444,
+      "probe_rate": 0.7222222222222222,
+      "difference": 0.02777777777777779
+    },
+    "sun3d-mit_lab_hj-lab_hj_tea_nov_2_2012_scan1_erika": {
+      "pairs": 6,
+      "baseline_count": 4,
+      "probe_count": 4,
+      "baseline_rate": 0.6666666666666666,
+      "probe_rate": 0.6666666666666666,
+      "difference": 0.0
+    }
+  },
+  "official": {
+    "available": false,
+    "reason": "partial label-blind development kill-test"
+  },
+  "kill_gate": {
+    "applicable": true,
+    "rule": "net >= 2 and one-sided McNemar p < 0.25 with zero online errors and all finite poses",
+    "advance_to_full": true
+  },
+  "telemetry": {
+    "mean_rounds": 2.866396761133603,
+    "mean_baseline_runtime_sec": 0.5739206887570866,
+    "mean_probe_runtime_sec": 1.495549186805668
+  }
+}

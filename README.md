@@ -54,6 +54,15 @@ data/
 
 ## 运行
 
+ProbeRegor（line witness、跨轮Beta posterior、6DoF信息选种和各向异性再生）：
+
+```text
+probe_regor/README.md
+probe_regor/RESULTS.md
+```
+
+实现、去标签在线协议、标签盲随机247和完整1781指标均保存在 `probe_regor/`，不修改现有 REGOR-S2 入口。
+
 3DMatch + FCGF：
 
 ```bash

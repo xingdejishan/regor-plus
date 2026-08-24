@@ -4,4 +4,5 @@ tqdm
 easydict
 open3d
 scikit-learn
+scipy
 nibabel
