@@ -1,0 +1,96 @@
+{
+  "scope": "offline Frontier Separability diagnostic; GT selects positive/hard-negative modes only",
+  "candidate_input": "sanitized GT-free G17 retained modes and members",
+  "input_pair_count": 247,
+  "evaluable_pair_count": 201,
+  "unevaluable_pair_count": 46,
+  "error_count": 0,
+  "config": {
+    "patch_centers": 384,
+    "graph_neighbors": 8,
+    "patch_knn": 96,
+    "scales": [
+      4.0,
+      8.0,
+      16.0
+    ],
+    "position_tolerance": 2.5,
+    "graph_tolerance": 2.5,
+    "normal_tolerance": 0.25,
+    "shape_tolerance": 0.35,
+    "multiscale_votes": 2,
+    "query_count": 32,
+    "anchor_count": 4,
+    "anchor_residual_m": 0.1,
+    "shell_tolerance": 2.5,
+    "search_radius": 8.0,
+    "max_domain_candidates": 8,
+    "success_rre_deg": 15.0,
+    "success_rte_cm": 30.0,
+    "seed": 51
+  },
+  "metrics": {
+    "random": {
+      "query_count": 6432,
+      "positive_nonempty": 1484,
+      "negative_nonempty": 1587,
+      "separated": 811,
+      "positive_survival_rate": 0.23072139303482586,
+      "negative_survival_rate": 0.24673507462686567,
+      "separation_rate": 0.12608830845771143
+    },
+    "high_curvature": {
+      "query_count": 6432,
+      "positive_nonempty": 1366,
+      "negative_nonempty": 1428,
+      "separated": 819,
+      "positive_survival_rate": 0.21237562189054726,
+      "negative_survival_rate": 0.22201492537313433,
+      "separation_rate": 0.12733208955223882
+    },
+    "high_disagreement": {
+      "query_count": 6432,
+      "positive_nonempty": 442,
+      "negative_nonempty": 365,
+      "separated": 382,
+      "positive_survival_rate": 0.06871890547263682,
+      "negative_survival_rate": 0.05674751243781095,
+      "separation_rate": 0.05939054726368159
+    },
+    "symmetry_frontier": {
+      "query_count": 3705,
+      "positive_nonempty": 2789,
+      "negative_nonempty": 2792,
+      "separated": 615,
+      "positive_survival_rate": 0.7527665317139002,
+      "negative_survival_rate": 0.7535762483130904,
+      "separation_rate": 0.1659919028340081
+    },
+    "single_frontier": {
+      "query_count": 3720,
+      "positive_nonempty": 2791,
+      "negative_nonempty": 2792,
+      "separated": 622,
+      "positive_survival_rate": 0.750268817204301,
+      "negative_survival_rate": 0.7505376344086021,
+      "separation_rate": 0.16720430107526882
+    },
+    "point": {
+      "query_count": 3705,
+      "positive_nonempty": 3640,
+      "negative_nonempty": 3523,
+      "separated": 131,
+      "positive_survival_rate": 0.9824561403508771,
+      "negative_survival_rate": 0.9508771929824561,
+      "separation_rate": 0.03535762483130904
+    }
+  },
+  "frontier_minus_random_separation": 0.039903594376296675,
+  "criteria": {
+    "frontier_gain_at_least_0_15": false,
+    "positive_survival_above_0_90": false,
+    "multiscale_better_than_single": false,
+    "four_anchor_better_than_point": true
+  },
+  "continue_to_branch_and_contract": false
+}
